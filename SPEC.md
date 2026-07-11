@@ -135,7 +135,9 @@ Two departures from a naive reading of the source doc:
 - **Offset is `− vert_offset`, not `+`.** Siglent's document shows `+ vert_offset` for
   saved files (its live-SCPI path uses `−`); on these V4.0 HD files the `−` sign is what
   matches ground truth. Confirmed by fitting all four ±/probe variants against the two
-  known levels — only this one landed on 0 V and 4.5 V.
+  known levels — only this one landed on 0 V and 4.5 V. The same PDF's `.slg`
+  sample-logger chapter likewise *subtracts* its offset term, so the vendor's sign
+  conventions differ even between its own formats.
 - **Probe multiplies the whole expression** (offset included). On the verified captures
   `volt_div_val` did *not* already include the 10× probe — only ×probe gives both the
   right swing and the right absolute levels.
