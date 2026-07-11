@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siglent-bin"
+version = "0.1.0"
+description = "Reader for Siglent Binary Format V4.0 (.bin) oscilloscope waveforms (SDS800X HD)"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Miķelis Vindavs" }]
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+keywords = [
+    "siglent", "oscilloscope", "waveform", "binary",
+    "sds800x", "sds802x", "sds804x", "sds812x", "sds814x", "sds822x", "sds824x",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.scripts]
+siglent-bin = "siglent_bin:_main"
+
+[project.urls]
+Source = "https://github.com/vindavs/siglent-bin"
+Issues = "https://github.com/vindavs/siglent-bin/issues"
+
+[tool.setuptools]
+py-modules = ["siglent_bin"]

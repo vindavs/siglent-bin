@@ -1,0 +1,3 @@
+include SPEC.md
+recursive-include tests *.py
+recursive-include tests/fixtures *.bin
