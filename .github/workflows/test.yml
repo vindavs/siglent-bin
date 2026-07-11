@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install .
+      - run: python -W error::ResourceWarning tests/test_siglent_bin.py
+      - name: smoke test the installed package outside the checkout
+        run: cd "$RUNNER_TEMP" && siglent-bin "$GITHUB_WORKSPACE"/tests/fixtures/*.bin
+      - name: sdist carries the spec and fixtures
+        run: |
+          pip install build
+          python -m build --sdist
+          tar tzf dist/*.tar.gz | grep -q 'SPEC.md'
+          tar tzf dist/*.tar.gz | grep -q 'fixtures/sds814x_C1_30.bin'
