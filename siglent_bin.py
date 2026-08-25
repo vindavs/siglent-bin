@@ -3,7 +3,8 @@
 
 Verified against the **SDS800X HD** family (SDS814X). Parses the 4 KB header and
 returns a channel's samples in real units — volts, or amps for a channel in amps
-display mode — plus a time axis. Pure numpy.
+display mode — plus `t0`, the timestamp of sample 0; call `time_axis()` for the
+full per-sample time array. Pure numpy.
 
 Why this exists: samples are stored as **offset-binary uint16 centred at 32768**
 (16-bit "HD" capture). Reading them as *signed* int16 silently inverts any trace
@@ -86,7 +87,7 @@ def _unit(h, a):
     return "*".join(parts), d
 
 
-def read(path, apply_probe=True):
+def read(path, apply_probe=True, ref_position=50.0):
     """Parse one Siglent V4.0 .bin (a single enabled trace). Returns a dict:
 
         source        -> which trace this file holds: 'C1'..'C8' or 'F1'..'F4',
@@ -97,13 +98,26 @@ def read(path, apply_probe=True):
         unit_raw      -> the raw 7-int unit descriptor,
         zoom          -> True for a zoom (Z) save; the time axis then comes from
                          the stored zoom timebase (held in time_div/time_delay),
+        ref_position  -> the value used to place t = 0 (echoed back),
         raw           -> samples as offset-binary uint16 (polarity-correct),
         values        -> samples converted to `unit` (volts for 'V', amps for 'A'),
-        time          -> seconds, same length as values.
+                         as float32 (see below),
+        t0            -> seconds, the timestamp of sample 0 (float64). Call
+                         `time_axis(d)` for the full per-sample array.
 
     `values` is `((code-center)*vdiv/cpd - voff) * probe` — the scope's on-screen
     reading. Calibrated against known 0/3/4.5/5 V references across vertical
     settings; the offset term is `- voff` (see SPEC.md).
+    Returned as float32; representative SDS814X voltage and current captures
+    round-trip to their original 12-bit codes.
+
+    ref_position is the scope's horizontal reference position in percent
+    (`:TIMebase:REFerence:POSition`, 0-100), which fixes where the trigger sits
+    in the record: `t = 0` lands at `ref_position%` of the screen span.
+    ⚠️ The header does NOT store it, so absolute time is only right if the value
+    passed matches what the scope was set to; the default 50 assumes screen centre.
+    Sample spacing, and therefore every relative measurement, is unaffected.
+    See SPEC.md.
 
     apply_probe (default True) multiplies by `probe` — the stored vdiv does NOT
     already include it (the swing only comes out right with it applied). In V
@@ -118,8 +132,18 @@ def read(path, apply_probe=True):
     Raises ValueError for a file that isn't a parseable V4.0 capture (short or
     truncated file, wrong version, out-of-range header fields).
     """
+    invalid_ref = f"ref_position must be a finite number from 0 to 100, got {ref_position!r}"
+    if isinstance(ref_position, (bool, np.bool_)) or not isinstance(ref_position, Real):
+        raise ValueError(invalid_ref)
+    try:
+        ref_position = float(ref_position)
+    except (OverflowError, TypeError, ValueError) as e:
+        raise ValueError(invalid_ref) from e
+    if not math.isfinite(ref_position) or not 0 <= ref_position <= 100:
+        raise ValueError(invalid_ref)
+
     d, stored, center = _load(path)
-    samples = stored.astype(np.float64)
+    samples = stored.astype(np.float32)
 
     # value (in `unit`) = ((code-center)*vdiv/cpd - voff) * probe. vdiv is stored PRE-probe.
     # `probe` is the voltage attenuation in V mode (verified 1x/10x), a 1/(V/A) factor in
@@ -128,17 +152,20 @@ def read(path, apply_probe=True):
     if apply_probe:
         values = values * d["probe"]
 
-    half_span = d["time_div"] * d["grid"] / 2
-    i_t = np.arange(len(samples)) / d["sample_rate"]
-    if d["zoom"]:  # noqa: SIM108 - branch comments document the two axis conventions
-        # A zoom save carries its own timebase; the window centre sits at
-        # +time_delay — sign verified against slices at known positions (SPEC.md).
-        t = d["time_delay"] - half_span + i_t
-    else:
-        t = -half_span - d["time_delay"] + i_t
+    # Keep only the float64 origin here; time_axis() builds t0 + i/sample_rate on demand.
+    span = d["time_div"] * d["grid"]
+    t0 = -(ref_position / 100.0) * span + d["time_delay"]
 
-    d.update(raw=stored.astype(np.uint16), values=values, time=t)
+    d.update(raw=stored.astype(np.uint16), values=values, t0=t0, ref_position=ref_position)
     return d
+
+
+def time_axis(d):
+    """Build the float64 axis as ``t0 + arange(n) / sample_rate``.
+
+    This avoids accumulating error from a pre-rounded ``dt``.
+    """
+    return d["t0"] + np.arange(d["npoints"], dtype=np.float64) / d["sample_rate"]
 
 
 def _load(path):
@@ -157,7 +184,7 @@ def _load(path):
 
 def _parse_header(h, file_size, path):
     """Validate a .bin's header bytes `h` against the file's total size and
-    decode it: the read() result minus the sample/values/time arrays, plus the
+    decode it: the read() result minus raw/values/t0/ref_position, plus the
     private '_dt' / '_center' / '_itemsize' / '_data_off' needed to load the
     samples."""
     if len(h) < HEADER_BYTES:
@@ -287,7 +314,7 @@ def raw_uint16(path):
     return stored.astype(np.uint16), d["sample_rate"]
 
 
-def read_group(paths, apply_probe=True, strict=True):
+def read_group(paths, apply_probe=True, strict=True, ref_position=50.0):
     """Load several per-trace files from one acquisition and return
     {source: read()-result}, e.g. {'C1': ..., 'C2': ...}. All traces share the
     time base, so with `strict` everything the time axis is built from
@@ -297,7 +324,7 @@ def read_group(paths, apply_probe=True, strict=True):
     """
     out = {}
     for p in paths:
-        d = read(p, apply_probe=apply_probe)
+        d = read(p, apply_probe=apply_probe, ref_position=ref_position)
         if d["source"] in out:
             raise ValueError(f"{d['source']} appears twice in group")
         out[d["source"]] = d
@@ -348,7 +375,7 @@ def _main(argv=None):
         for p in paths:
             try:
                 d = read(p)
-            except Exception as e:  # noqa: BLE001 - report each file and continue the batch
+            except Exception as e:  # noqa: BLE001 - one failure per input must not abort the rest
                 print(e, file=sys.stderr)  # read()'s errors already name the file
                 failed += 1
                 continue

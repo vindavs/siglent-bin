@@ -4,6 +4,7 @@ Every fixture is unmodified scope output. Run with `pytest` or directly:
 `python3 tests/test_siglent_bin.py`.
 """
 
+import hashlib
 import os
 import struct
 import sys
@@ -25,8 +26,27 @@ def test_read_single_channel():
     assert d["npoints"] == 100000
     assert d["data_width"] == 1  # 16-bit
     assert d["raw"].dtype == np.uint16
-    assert len(d["values"]) == len(d["raw"]) == len(d["time"])
-    assert np.all(np.diff(d["time"]) > 0)  # time strictly increasing
+    assert d["values"].dtype == np.float32
+    t = siglent_bin.time_axis(d)
+    assert t.dtype == np.float64
+    assert len(d["values"]) == len(d["raw"]) == len(t)
+    assert np.all(np.diff(t) > 0)  # time strictly increasing
+
+
+def test_raw_code_round_trips_exactly_through_float32_values():
+    """Representative SDS814X voltage and current fixtures round-trip to their raw codes."""
+    for f, apply_probe in [
+        ("sds814x_C1_30.bin", False),
+        ("sds814x_C1_30.bin", True),
+        ("known3v_probe10x.bin", True),
+        ("amps_30a.bin", True),
+    ]:
+        d = siglent_bin.read(os.path.join(FIX, f), apply_probe=apply_probe)
+        v = d["values"].astype(np.float64)  # widen only for the inverse arithmetic
+        if apply_probe:
+            v = v / d["probe"]
+        code = np.round((v + d["voff"]) * d["code_per_div"] / d["vdiv"]) + 32768
+        assert np.array_equal(code.astype(np.int64), d["raw"].astype(np.int64)), f
 
 
 def test_offset_binary_not_signed():
@@ -135,7 +155,7 @@ def test_zoom_save():
     assert z1["source"] == "C1"  # the zoomed channel
     assert abs(z1["time_div"] - 0.002) < 1e-12
     assert abs(z1["time_delay"] - 0.015) < 1e-12
-    assert abs(z1["time"][0] - 0.005) < 1e-9  # 15 ms centre - 10 ms half-window
+    assert abs(z1["t0"] - 0.005) < 1e-9  # 15 ms centre - 10 ms half-window
     idx = c1["raw"].tobytes().find(z1["raw"].tobytes())
     assert idx >= 0 and idx % 2 == 0  # contiguous slice of the record
     s = idx // 2
@@ -233,19 +253,57 @@ def test_synthetic_format_variants():
         os.unlink(path)
 
 
-def test_time_delay_sign():
-    """Locks the time-axis formula's `- time_delay` sign. This capture is one
-    trigger-synced sequence segment: rising-edge trigger at ~2 V with the delay
-    at -100 ms, so the trigger instant (the ~2 V crossing) must sit at sample
-    (tdiv*grid/2 + tdelay)*fs = 4000 — where time[] reads 0. A flipped sign
-    would put it at sample 6000."""
-    d = siglent_bin.read(os.path.join(FIX, "trigsync_neg100ms.bin"))
+def test_time_axis_reference_position():
+    """A 30% reference places this fixture's ~2 V trigger crossing at t=0."""
+    path = os.path.join(FIX, "trigsync_neg100ms.bin")
+    d = siglent_bin.read(path, ref_position=30)
     assert d["time_delay"] == -0.1
-    i0 = int(np.argmin(np.abs(d["time"])))  # sample where t = 0
+    assert d["ref_position"] == 30
+    t = siglent_bin.time_axis(d)
+    i0 = int(np.argmin(np.abs(t)))  # sample where t = 0
     assert i0 == 4000
     v = d["values"]
+    edge = np.where((v[:-1] <= 2.0) & (v[1:] > 2.0))[0]
+    assert abs(int(edge[0]) - i0) <= 10  # t = 0 really is the trigger
     assert 1.5 < v[i0] < 2.5  # trigger level ~2 V, mid-edge
     assert v[i0 - 200] < 1.0 < 4.0 < v[i0 + 500]  # edge brackets the trigger
+
+    # The 50% default misplaces this 30%-reference capture.
+    d50 = siglent_bin.read(path)
+    assert d50["ref_position"] == 50.0
+    t50 = siglent_bin.time_axis(d50)
+    assert int(np.argmin(np.abs(t50))) == 6000
+    # Only the offset moves; spacing is identical, so relative timing is safe.
+    assert np.allclose(np.diff(t), np.diff(t50))
+
+
+def test_ref_position_shifts_the_axis_linearly():
+    path = os.path.join(FIX, "trigsync_neg100ms.bin")
+    a = siglent_bin.read(path, ref_position=0)
+    b = siglent_bin.read(path, ref_position=25)
+    span = a["time_div"] * a["grid"]
+    assert np.allclose(siglent_bin.time_axis(a) - siglent_bin.time_axis(b), 0.25 * span)
+
+
+def test_read_rejects_invalid_ref_position():
+    path = os.path.join(FIX, "trigsync_neg100ms.bin")
+    for value in (-1, 101, float("nan"), float("inf"), True, "50"):
+        try:
+            siglent_bin.read(path, ref_position=value)
+            raise AssertionError(f"expected ValueError for ref_position={value!r}")
+        except ValueError as e:
+            assert "ref_position" in str(e) and "0 to 100" in str(e)
+
+
+def test_read_group_passes_ref_position():
+    paths = [os.path.join(FIX, f"sds814x_C{c}_30.bin") for c in (1, 2)]
+    g = siglent_bin.read_group(paths, ref_position=30)
+    assert all(d["ref_position"] == 30 for d in g.values())
+    centre = siglent_bin.read_group(paths)
+    span = g["C1"]["time_div"] * g["C1"]["grid"]
+    axis_centre = siglent_bin.time_axis(centre["C1"])
+    axis_30 = siglent_bin.time_axis(g["C1"])
+    assert np.allclose(axis_centre - axis_30, -0.20 * span)
 
 
 def test_si_prefix():
@@ -279,9 +337,9 @@ def test_read_group_aligned():
     npts = {d["npoints"] for d in chans.values()}
     assert rates == {20000.0} and npts == {100000}
     # shared time base
-    t0 = chans["C1"]["time"]
+    axis0 = siglent_bin.time_axis(chans["C1"])
     for c in chans:
-        assert np.array_equal(chans[c]["time"], t0)
+        assert np.array_equal(siglent_bin.time_axis(chans[c]), axis0)
 
 
 def _tmp_bin(blob):
@@ -338,6 +396,34 @@ def test_read_group_rejects_mixed_acquisitions():
         assert sorted(siglent_bin.read_group(group, strict=False)) == ["C1", "C2"]
     finally:
         os.unlink(path)
+
+
+# Historical float64-axis hashes generated at commit 37e55a35 from
+# `read(...)["time"].tobytes()`. Do not regenerate them from current code.
+_PRE_MIGRATION_AXIS = [
+    ("sds814x_C1_30.bin", "b2270304868bafd1773144d7c136afbe", 100000),
+    ("cal_square_1khz.bin", "e7b82e7b8255fed947e58095376a2ec8", 5000),
+    ("trigsync_neg100ms.bin", "84606c2c4d168d4dc6e62d5843abfa4c", 10000),
+    ("zoom_Z1.bin", "4bbfca8e2e4fee5ba362b309ac5acf59", 200),
+]
+
+
+def test_time_axis_matches_the_pre_migration_axis_bit_for_bit():
+    """Cover default, non-default-reference and zoom time-axis paths."""
+    for name, want_hash, want_len in _PRE_MIGRATION_AXIS:
+        d = siglent_bin.read(os.path.join(FIX, name))
+        t = siglent_bin.time_axis(d)
+        assert t.dtype == np.float64, (name, t.dtype)
+        assert len(t) == want_len, (name, len(t))
+        got = hashlib.sha256(np.ascontiguousarray(t).tobytes()).hexdigest()[:32]
+        assert got == want_hash, f"{name}: axis changed since the migration ({got})"
+
+
+def test_t0_is_a_double_precision_scalar():
+    """Keep ``t0`` a Python float; float32 timestamps collide at deep-memory rates."""
+    d = siglent_bin.read(os.path.join(FIX, "sds814x_C1_30.bin"))
+    assert isinstance(d["t0"], float), type(d["t0"])
+    assert float(np.float32(d["t0"])) != d["t0"]
 
 
 if __name__ == "__main__":
