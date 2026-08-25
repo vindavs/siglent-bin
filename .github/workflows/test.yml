@@ -8,11 +8,24 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - run: pip install ruff==0.16.4
+      - run: ruff format --check .
+      - run: ruff check .
+
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.9', '3.14']
+        python-version: ['3.11', '3.14']
     steps:
       - uses: actions/checkout@v7
         with:

@@ -9,7 +9,7 @@ description = "Reader for Siglent Binary Format V4.0 (.bin) oscilloscope wavefor
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Miķelis Vindavs" }]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = ["numpy"]
 keywords = [
     "siglent", "oscilloscope", "waveform", "binary",
@@ -30,3 +30,15 @@ Issues = "https://github.com/vindavs/siglent-bin/issues"
 
 [tool.setuptools]
 py-modules = ["siglent_bin"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF", "BLE"]
+# Ruff's formatter owns line length.
+ignore = ["E501"]
