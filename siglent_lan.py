@@ -7,6 +7,7 @@ file codec's offset-binary convention; unit and time geometry come from SCPI
 queries. Model- and firmware-specific behavior is documented in SPEC.md.
 """
 
+import datetime
 import math
 import socket
 import struct
@@ -276,6 +277,20 @@ def fetch(host, source="C1", port=PORT, timeout=25.0, apply_probe=True, grid=GRI
         return out
 
 
+def sync_clock(host, when=None, port=PORT, timeout=15.0):
+    """Set the scope's session clock, defaulting to the host's local time.
+
+    Returns the ``before`` and ``after`` readbacks as ``(YYYYMMDD, HHMMSS)``.
+    """
+    when = when or datetime.datetime.now()
+    with Scope(host, port, timeout) as s:
+        before = (s.query(":SYSTem:DATE?"), s.query(":SYSTem:TIME?"))
+        s.write(f":SYSTem:DATE {when:%Y%m%d}")
+        s.write(f":SYSTem:TIME {when:%H%M%S}")
+        after = (s.query(":SYSTem:DATE?"), s.query(":SYSTem:TIME?"))
+    return {"before": before, "after": after, "set_to": when.strftime("%Y%m%d %H%M%S")}
+
+
 def fetch_group(host, sources=("C1", "C2", "C3", "C4"), **kw):
     """Fetch each enabled source and return ``{source: [frames]}``."""
     out = {}
@@ -322,9 +337,15 @@ def _main(argv=None):
 
     args = sys.argv[1:] if argv is None else argv
     if not args:
-        print("usage: siglent-lan HOST [SOURCE ...]", file=sys.stderr)
+        print("usage: siglent-lan HOST [SOURCE ...] [--sync-clock]", file=sys.stderr)
         sys.exit(2)
+    # Clock synchronisation is opt-in.
+    sync = "--sync-clock" in args
+    args = [a for a in args if a != "--sync-clock"]
     host, sources = args[0], args[1:] or ["C1"]
+    if sync:
+        r = sync_clock(host)
+        print(f"{host} clock {' '.join(r['before'])} -> {' '.join(r['after'])}")
     for src in sources:
         try:
             frames = fetch(host, src)

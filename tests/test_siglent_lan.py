@@ -88,6 +88,7 @@ class FakeScope:
         self.unit = unit  # None models a firmware that never answers :CHANnel<n>:UNIT?
         self.data_interval = data_interval  # 0 models a firmware that never fills 0x88 in
         self.fragment_block_terminator = fragment_block_terminator
+        self.clock = ["19700101", "000000"]
         self.commands, self.frame = [], 1
         self._srv = socket.socket()
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -152,6 +153,12 @@ class FakeScope:
             conn.sendall(f"{REF_POS:.6E}\n".encode())
         elif "TIMEBASE:REFERENCE?" in up:
             conn.sendall(b"DELay\n")
+        elif up.startswith(":SYSTEM:DATE") or up.startswith(":SYSTEM:TIME"):
+            if "?" in up:
+                conn.sendall(self.clock[0 if "DATE" in up else 1].encode() + b"\n")
+            else:
+                i = 0 if "DATE" in up else 1
+                self.clock[i] = up.split()[1]
         elif up.endswith("UNIT?"):
             # Handle before the catch-all, whose "ON" would pass unit validation.
             if self.unit is not None:
@@ -456,6 +463,29 @@ def test_unpopulated_stride_field_is_not_an_error():
     _fake, frames = _fetch(sum_frames=1, sequence=False, data_interval=0)
     assert frames[0]["npoints"] == NPOINTS
     assert np.all(np.diff(siglent_bin.time_axis(frames[0])) > 0)
+
+
+def test_sync_clock_sets_the_scope_from_the_host():
+    """Set and read back the scope's session clock."""
+    import datetime
+
+    fake = FakeScope(sum_frames=1, sequence=False)
+    try:
+        when = datetime.datetime(2026, 8, 26, 1, 2, 3)
+        r = siglent_lan.sync_clock("127.0.0.1", when=when, port=fake.port, timeout=5)
+        assert r["before"] == ("19700101", "000000")
+        assert r["after"] == ("20260826", "010203")
+        ups = [c.upper() for c in fake.commands]
+        assert ":SYSTEM:DATE 20260826" in ups
+        assert ":SYSTEM:TIME 010203" in ups
+    finally:
+        fake.close()
+
+
+def test_fetch_never_touches_the_clock():
+    """Keep clock synchronisation out of the capture path."""
+    fake, _ = _fetch(sum_frames=1, sequence=False)
+    assert not any("SYSTEM:DATE" in c.upper() or "SYSTEM:TIME" in c.upper() for c in fake.commands)
 
 
 def test_descriptor_audit_checks_the_centre_referred_delay():
