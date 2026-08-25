@@ -274,13 +274,15 @@ def _build_logic_channels(path, items, threshold, hysteresis, decimate):
 
 
 class _WriteResult(str):
-    """Output path with the written decimation, point count and sample rate."""
+    """Output path with written geometry and CLI status."""
 
-    def __new__(cls, path, *, decimate, n_written, sample_rate):
+    def __new__(cls, path, *, decimate, n_written, sample_rate, threshold_summary, trigger_index):
         self = super().__new__(cls, path)
         self.decimate = decimate
         self.n_written = n_written
         self.sample_rate = sample_rate
+        self.threshold_summary = threshold_summary
+        self.trigger_index = trigger_index
         return self
 
 
@@ -334,20 +336,23 @@ def write(
     sample_rate = sample_rate / decimate
 
     # Resolve thresholds once so metadata and the logic chunk agree.
+    trigger_index = trigger_sample(items[0], decimate)
     comments = [
         f"sources = {', '.join(t['source'] for t in items)}",
-        f"trigger_sample = {trigger_sample(items[0], decimate)}",
+        f"trigger_sample = {trigger_index}",
         f"trigger_time_s = {float(items[0]['t0']):.6e}",
         *(f"unit_{t['source']} = {t['unit']}" for t in items if t.get("unit")),
     ]
     if source_file is not None:
         comments.append(f"source_file = {source_file}")
     bit_arrays = []
+    threshold_summary = "logic skipped (--no-logic)"
     if logic_names:
         bit_arrays, logic_comments = _build_logic_channels(
             path, items, threshold, hysteresis, decimate
         )
         comments.extend(logic_comments)
+        threshold_summary = logic_comments[0]
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("version", f"{SRZIP_VERSION}\n")
@@ -364,7 +369,14 @@ def write(
                 )
                 zf.writestr(f"analog-1-{i}-1", vals.tobytes())
 
-    return _WriteResult(path, decimate=decimate, n_written=n_written, sample_rate=sample_rate)
+    return _WriteResult(
+        path,
+        decimate=decimate,
+        n_written=n_written,
+        sample_rate=sample_rate,
+        threshold_summary=threshold_summary,
+        trigger_index=trigger_index,
+    )
 
 
 def write_frames(path_stem, frames, **kw):
@@ -382,3 +394,89 @@ def write_frames(path_stem, frames, **kw):
     for i, frame in enumerate(items, start=1):
         out.append(write(f"{stem}-{i:0{width}d}.sr", frame, **kw))
     return out
+
+
+def _main(argv=None):
+    import argparse
+    import glob
+
+    import siglent_bin
+
+    ap = argparse.ArgumentParser(
+        prog="siglent-sr", description="Convert Siglent V4.0 .bin captures to sigrok .sr files."
+    )
+    ap.add_argument(
+        "inputs",
+        nargs="*",
+        default=None,
+        help="capture files (default: *.bin and *.bin.gz)",
+    )
+    ap.add_argument("--no-logic", action="store_true", help="skip the thresholded logic channels")
+    ap.add_argument("--no-analog", action="store_true", help="skip the float32 analog channels")
+    ap.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="logic threshold in each trace's unit (default: auto per channel)",
+    )
+    ap.add_argument(
+        "--hysteresis",
+        type=float,
+        default=0.0,
+        help="Schmitt trigger band in each trace's unit (default: 0)",
+    )
+    ap.add_argument(
+        "--decimate", type=int, default=1, help="keep every Nth sample (default: 1, no decimation)"
+    )
+    ap.add_argument(
+        "--max-points",
+        type=int,
+        default=DEFAULT_MAX_POINTS,
+        help=f"refuse above this total sample count (default: {DEFAULT_MAX_POINTS})",
+    )
+    args = ap.parse_args(sys.argv[1:] if argv is None else argv)
+
+    failed = 0
+    default_scan = not args.inputs
+    patterns = args.inputs or ["*.bin", "*.bin.gz"]
+    matched = False
+    for pat in patterns:
+        paths = sorted(glob.glob(pat)) or ([pat] if os.path.exists(pat) else [])
+        if not paths:
+            if not default_scan:
+                print(f"{pat}: no files match", file=sys.stderr)
+                failed += 1
+            continue
+        matched = True
+        for p in paths:
+            out = (p[:-7] if p.endswith(".bin.gz") else os.path.splitext(p)[0]) + ".sr"
+            try:
+                d = siglent_bin.read(p)
+                result = write(
+                    out,
+                    d,
+                    logic=not args.no_logic,
+                    analog=not args.no_analog,
+                    threshold=args.threshold,
+                    hysteresis=args.hysteresis,
+                    decimate=args.decimate,
+                    max_points=args.max_points,
+                    source_file=p,
+                )
+            except Exception as e:  # noqa: BLE001 - one failure per input must not abort the rest
+                print(f"{p}: {e}", file=sys.stderr)
+                failed += 1
+                continue
+            print(
+                f"{out}: {d['source']}  {result.n_written} pts  "
+                f"{result.sample_rate:g} Sa/s  "
+                f"{result.threshold_summary}  trigger_sample = {result.trigger_index}"
+            )
+    if default_scan and not matched:
+        print("*.bin[.gz]: no files match", file=sys.stderr)
+        failed += 1
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

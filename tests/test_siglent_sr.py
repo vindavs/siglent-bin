@@ -671,6 +671,90 @@ def test_write_frames_each_file_has_correct_payload_size():
                 assert len(payload) == expected_bytes
 
 
+def test_main_converts_files_and_reports():
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "cap.bin")
+        with open(os.path.join(FIX, "cal_square_1khz.bin"), "rb") as f:
+            data = f.read()
+        with open(src, "wb") as f:
+            f.write(data)
+        with contextlib.redirect_stdout(out):
+            rc = siglent_sr._main([src])
+        assert rc == 0
+        written = os.path.join(tmp, "cap.sr")
+        assert os.path.exists(written)
+    text = out.getvalue()
+    assert "cap.sr" in text
+    assert "C1" in text
+    assert "1.5" in text  # auto threshold
+    assert "2500" in text  # trigger sample
+    assert "10 edges" in text
+
+
+def test_main_default_scan_includes_gzip_and_strips_both_suffixes():
+    import contextlib
+    import io
+
+    d = siglent_bin.read(os.path.join(FIX, "cal_square_1khz.bin"))
+    out = io.StringIO()
+    old_cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            siglent_bin.write(os.path.join(tmp, "compressed.bin.gz"), d)
+            os.chdir(tmp)
+            with contextlib.redirect_stdout(out):
+                rc = siglent_sr._main([])
+        finally:
+            os.chdir(old_cwd)
+        assert rc == 0
+        assert os.path.exists(os.path.join(tmp, "compressed.sr"))
+        assert not os.path.exists(os.path.join(tmp, "compressed.bin.sr"))
+    assert "compressed.sr" in out.getvalue()
+
+
+def test_main_reports_failure_for_unreadable_input():
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = os.path.join(tmp, "bad.bin")
+        with open(bad, "wb") as f:
+            f.write(b"not a capture")
+        with contextlib.redirect_stderr(err):
+            rc = siglent_sr._main([bad])
+    assert rc == 1
+    assert "bad.bin" in err.getvalue()
+
+
+def test_main_processes_remaining_inputs_after_one_fails():
+    """Process all inputs and fail the run if any input fails."""
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    err = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        good = os.path.join(tmp, "good.bin")
+        with open(os.path.join(FIX, "cal_square_1khz.bin"), "rb") as f:
+            data = f.read()
+        with open(good, "wb") as f:
+            f.write(data)
+        bad = os.path.join(tmp, "bad.bin")
+        with open(bad, "wb") as f:
+            f.write(b"not a capture")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = siglent_sr._main([good, bad])
+        assert rc == 1
+        assert os.path.exists(os.path.join(tmp, "good.sr"))
+    assert "good.sr" in out.getvalue()
+    assert "bad.bin" in err.getvalue()
+
+
 def test_write_frames_strips_sr_suffix_from_path_stem():
     """Strip an existing .sr suffix before adding frame numbering."""
     d = siglent_bin.read(os.path.join(FIX, "cal_square_1khz.bin"))
