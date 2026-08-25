@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Reader for Siglent "Binary Format V4.0" oscilloscope waveform files (.bin).
+"""Codec for Siglent "Binary Format V4.0" oscilloscope waveform files (.bin).
 
-Verified against the **SDS800X HD** family (SDS814X). Parses the 4 KB header and
-returns a channel's samples in real units — volts, or amps for a channel in amps
-display mode — plus `t0`, the timestamp of sample 0; call `time_axis()` for the
-full per-sample time array. Pure numpy.
+Reading is verified on an SDS814X from the **SDS800X HD** family. The codec
+parses the 4 KB header and returns a channel's samples in real units — volts, or
+amps for a channel in amps display mode — plus `t0`, the time of sample 0; call
+`time_axis()` for the full per-sample time array. Pure numpy.
 
 Why this exists: samples are stored as **offset-binary uint16 centred at 32768**
 (16-bit "HD" capture). Reading them as *signed* int16 silently inverts any trace
@@ -24,14 +24,83 @@ Oscilloscope" (V4.0). Header offsets and the code->volts formula are documented
 there; see SPEC.md for the field table with fact-vs-inference marked.
 """
 
+import contextlib
 import glob
+import gzip
+import math
 import os
 import re
+import secrets
+import stat
 import struct
+import zlib
+from collections.abc import Mapping
+from numbers import Real
+from typing import TypedDict
 
 import numpy as np
 
 HEADER_BYTES = 0x1000
+_INT32_MAX = (1 << 31) - 1
+
+
+class Trace(TypedDict, total=False):
+    """Waveform fields shared by the file, LAN and srzip paths.
+
+    ``descriptor_stamp`` is diagnostic data, not an acquisition timestamp.
+    """
+
+    source: str
+    sample_rate: float
+    time_div: float
+    time_delay: float
+    grid: int
+    npoints: int
+    data_width: int
+    vdiv: float
+    voff: float
+    code_per_div: int | float
+    probe: float
+    unit: str | None
+    unit_raw: tuple[int, int, int, int, int, int, int]
+    zoom: bool
+    ref_position: float
+    raw: np.ndarray
+    values: np.ndarray
+    t0: float
+    descriptor_stamp: tuple[int, int, int, int, int, float] | None
+    frame: int
+    frames_total: int
+    sequence: bool
+    ref_strategy: str
+    desc_delay: float
+
+
+def _open_atomic_temp(destination):
+    """Create a sibling temporary using the umask or the destination's mode."""
+    try:
+        destination_mode = stat.S_IMODE(os.stat(destination).st_mode)
+    except FileNotFoundError:
+        destination_mode = None
+    parent = os.path.dirname(destination)
+    basename = os.path.basename(destination)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for _ in range(100):
+        temporary = os.path.join(parent, f".{basename}.{secrets.token_hex(16)}")
+        try:
+            fd = os.open(temporary, flags, 0o666)
+        except FileExistsError:
+            continue
+        try:
+            if destination_mode is not None:
+                os.fchmod(fd, destination_mode)
+        except BaseException:
+            os.close(fd)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+            raise
+        return fd, temporary
+    raise FileExistsError(f"could not allocate a temporary file beside {destination!r}")
 
 
 def _f64(h, a):
@@ -87,6 +156,213 @@ def _unit(h, a):
     return "*".join(parts), d
 
 
+# Unit descriptors are [type, V_num, V_den, A_num, A_den, s_num, s_den].
+# Type 0 composes powers of V, A and s.
+_UNIT_DESCRIPTORS = {
+    "V": (0, 1, 1, 0, 1, 0, 1),
+    "A": (0, 0, 1, 1, 1, 0, 1),
+    "s": (0, 0, 1, 0, 1, 1, 1),
+}
+_SAMPLES_DESCRIPTOR = (7, 0, 1, 0, 1, 0, 1)  # named unit "Sa"
+
+
+def _pack_dwu(h, a, value, descriptor):
+    """Write an unscaled Data-With-Unit with magnitude index 8 (x1)."""
+    struct.pack_into("<d", h, a, float(value))
+    struct.pack_into("<i", h, a + 8, 8)
+    struct.pack_into("<7i", h, a + 0x0C, *descriptor)
+
+
+def _as_finite(trace, key, path, *, positive=False):
+    value = trace.get(key)
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{path}: {key} must be a finite number, got {value!r}")
+    try:
+        value = float(value)
+    except (OverflowError, ValueError) as e:
+        raise ValueError(f"{path}: {key} must be a finite number, got {value!r}") from e
+    if not math.isfinite(value) or (positive and value <= 0):
+        condition = "finite and > 0" if positive else "finite"
+        raise ValueError(f"{path}: {key} must be {condition}, got {value!r}")
+    return value
+
+
+def _as_int32(value, label, path, *, positive=False):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{path}: {label} must be an integer, got {value!r}")
+    try:
+        f = float(value)
+    except (OverflowError, ValueError) as e:
+        raise ValueError(f"{path}: {label} must be an integer, got {value!r}") from e
+    if not math.isfinite(f) or not f.is_integer():
+        raise ValueError(f"{path}: {label} must be an integer, got {value!r}")
+    value = int(f)
+    low = 1 if positive else -(1 << 31)
+    if not low <= value <= _INT32_MAX:
+        condition = "a positive int32" if positive else "an int32"
+        raise ValueError(f"{path}: {label} must be {condition}, got {value!r}")
+    return value
+
+
+def _unit_descriptor(trace, unit, path):
+    """Return a validated 7-int descriptor from ``unit_raw`` or a known label.
+
+    Unknown units are rejected because the format has no unknown-unit value.
+    """
+    if unit is None:
+        raw = trace.get("unit_raw")
+        if raw is not None:
+            try:
+                raw = tuple(raw)
+            except TypeError as e:
+                raise ValueError(f"{path}: unit_raw must be an iterable of 7 ints") from e
+            if len(raw) != 7:
+                raise ValueError(f"{path}: unit_raw must be 7 ints, got {raw!r}")
+            return tuple(_as_int32(v, f"unit_raw[{i}]", path) for i, v in enumerate(raw))
+        unit = trace.get("unit")
+    if unit in _UNIT_DESCRIPTORS:
+        return _UNIT_DESCRIPTORS[unit]
+    raise ValueError(
+        f"{path}: cannot write a unit descriptor for unit {unit!r}: pass unit= as one of "
+        f"{sorted(_UNIT_DESCRIPTORS)}, or supply the trace's 7-int `unit_raw`. "
+        "Volts is not assumed for an unknown unit."
+    )
+
+
+def write(path, trace, unit=None):
+    """Write a canonical V4 archive from one analog ``read()`` or live frame.
+
+    Output is a 4096-byte header followed by 16-bit little-endian ``raw``
+    samples. Math, zoom, 8-bit, fractional ``code_per_div`` and unknown-unit
+    traces are rejected. Only fields understood by this package are preserved;
+    scope import has not been verified.
+
+    The format has no horizontal ``ref_position`` field, so ``time_delay`` is
+    stored at a 50% reference to preserve ``t0`` on a default read.
+    """
+    path_text = os.fsdecode(path)
+    if not isinstance(trace, Mapping):
+        raise ValueError(f"{path_text}: trace must be a mapping, got {type(trace).__name__}")
+    source = trace.get("source")
+    if not (isinstance(source, str) and re.fullmatch(r"[Cc]([1-8])", source)):
+        raise ValueError(
+            f"{path_text}: can only write analog channels C1-C8, got source {source!r} "
+            "(math and zoom traces are not supported)"
+        )
+    if trace.get("zoom"):
+        raise ValueError(
+            f"{path_text}: {source} is a zoom save; writing one back needs the zoom "
+            "timebase fields, which this writer does not fill in"
+        )
+    unit_raw = _unit_descriptor(trace, unit, path_text)
+
+    width = _as_int32(trace.get("data_width", 1), "data_width", path_text)
+    if width != 1:
+        raise ValueError(
+            f"{path_text}: write() supports only 16-bit traces (data_width=1); "
+            f"got data_width={width}. An 8-bit read uses codes centred on 128 "
+            "and cannot be promoted by copying them."
+        )
+
+    if "raw" not in trace:
+        raise ValueError(f"{path_text}: trace is missing required field 'raw'")
+    raw = np.asarray(trace["raw"])
+    if raw.ndim != 1 or raw.size == 0:
+        raise ValueError(f"{path_text}: `raw` must be a non-empty 1-D array, got shape {raw.shape}")
+    if not np.issubdtype(raw.dtype, np.integer):
+        # Do not silently truncate calibrated values into raw codes.
+        raise ValueError(
+            f"{path_text}: `raw` must hold integer codes, got dtype {raw.dtype} -- pass the "
+            "trace's `raw`, not its `values`"
+        )
+    if raw.min() < 0 or raw.max() > 0xFFFF:
+        raise ValueError(f"{path_text}: `raw` values {raw.min()}..{raw.max()} do not fit uint16")
+    npoints = int(raw.size)
+    if npoints > _INT32_MAX:
+        raise ValueError(f"{path_text}: raw holds {npoints} samples, beyond the int32 format")
+    if (
+        "npoints" in trace
+        and _as_int32(trace["npoints"], "npoints", path_text, positive=True) != npoints
+    ):
+        raise ValueError(
+            f"{path_text}: npoints says {trace['npoints']} but `raw` holds {npoints} samples"
+        )
+
+    cpd = _as_int32(trace.get("code_per_div"), "code_per_div", path_text, positive=True)
+    grid = _as_int32(trace.get("grid"), "grid", path_text, positive=True)
+    sample_rate = _as_finite(trace, "sample_rate", path_text, positive=True)
+    time_div = _as_finite(trace, "time_div", path_text, positive=True)
+    time_delay = _as_finite(trace, "time_delay", path_text)
+    t0 = _as_finite(trace, "t0", path_text)
+    vdiv = _as_finite(trace, "vdiv", path_text, positive=True)
+    voff = _as_finite(trace, "voff", path_text)
+    probe = _as_finite(trace, "probe", path_text, positive=True)
+    ref_position = None
+    if "ref_position" in trace:
+        ref_position = _as_finite(trace, "ref_position", path_text)
+        if not 0 <= ref_position <= 100:
+            raise ValueError(
+                f"{path_text}: ref_position must be between 0 and 100, got {ref_position}"
+            )
+        expected_t0 = time_delay - (ref_position / 100.0) * time_div * grid
+        if not math.isclose(t0, expected_t0, rel_tol=1e-12, abs_tol=1e-15):
+            raise ValueError(
+                f"{path_text}: t0 {t0!r} is inconsistent with time_delay {time_delay!r}, "
+                f"ref_position {ref_position!r}, time_div {time_div!r}, and grid {grid}"
+            )
+    # Preserve an already-centred delay; canonicalise all other inputs.
+    stored_time_delay = time_delay if ref_position == 50 else t0 + 0.5 * time_div * grid
+    if not math.isfinite(stored_time_delay):
+        raise ValueError(f"{path_text}: canonical time_delay is not finite")
+
+    c = int(source[1:]) - 1
+    # CH1-4 and CH5-8 use separate header banks of the same shape.
+    vd_a, vo_a, pr_a, cpd_a, b = (
+        (0x18, 0xB8, 0x244, 0x270, c) if c < 4 else (0x414, 0x4B4, 0x554, 0x574, c - 4)
+    )
+
+    h = bytearray(HEADER_BYTES)
+    struct.pack_into("<i", h, 0x00, 4)  # version: V4.0
+    struct.pack_into("<i", h, 0x04, HEADER_BYTES)  # data offset
+    on_a = 0x08 + 4 * c if c < 4 else 0x404 + 4 * (c - 4)
+    struct.pack_into("<i", h, on_a, 1)  # this channel enabled, all others 0
+
+    _pack_dwu(h, vd_a + 0x28 * b, vdiv, unit_raw)  # pre-probe, as read() returns it
+    _pack_dwu(h, vo_a + 0x28 * b, voff, unit_raw)
+    struct.pack_into("<d", h, pr_a + 8 * b, probe)
+    struct.pack_into("<i", h, cpd_a + 4 * b, cpd)
+
+    struct.pack_into("<i", h, 0x1EC, npoints)
+    _pack_dwu(h, 0x1F0, sample_rate, _SAMPLES_DESCRIPTOR)
+    _pack_dwu(h, 0x19C, time_div, _UNIT_DESCRIPTORS["s"])
+    _pack_dwu(h, 0x1C4, stored_time_delay, _UNIT_DESCRIPTORS["s"])
+    h[0x264] = 1  # data_width: 16-bit
+    h[0x265] = 0  # byte_order: little-endian
+    struct.pack_into("<i", h, 0x26C, grid)
+    struct.pack_into("<i", h, 0xAF4, 0)  # zoom_switch: an ordinary save
+
+    # Replace only after finalising and syncing the deterministic gzip stream.
+    destination = os.path.abspath(path_text)
+    fd, temporary = _open_atomic_temp(destination)
+    try:
+        with os.fdopen(fd, "wb") as base:
+            if path_text.endswith(".gz"):
+                with gzip.GzipFile(filename="", mode="wb", fileobj=base, mtime=0) as f:
+                    f.write(h)
+                    f.write(np.ascontiguousarray(raw, dtype="<u2").tobytes())
+            else:
+                base.write(h)
+                base.write(np.ascontiguousarray(raw, dtype="<u2").tobytes())
+            base.flush()
+            os.fsync(base.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
+    return path
+
+
 def read(path, apply_probe=True, ref_position=50.0):
     """Parse one Siglent V4.0 .bin (a single enabled trace). Returns a dict:
 
@@ -102,7 +378,7 @@ def read(path, apply_probe=True, ref_position=50.0):
         raw           -> samples as offset-binary uint16 (polarity-correct),
         values        -> samples converted to `unit` (volts for 'V', amps for 'A'),
                          as float32 (see below),
-        t0            -> seconds, the timestamp of sample 0 (float64). Call
+        t0            -> seconds, the time of sample 0 (float64). Call
                          `time_axis(d)` for the full per-sample array.
 
     `values` is `((code-center)*vdiv/cpd - voff) * probe` — the scope's on-screen
@@ -168,10 +444,45 @@ def time_axis(d):
     return d["t0"] + np.arange(d["npoints"], dtype=np.float64) / d["sample_rate"]
 
 
+def _is_gzip(path):
+    """Return whether ``path`` starts with the gzip magic bytes."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
+
+
 def _load(path):
-    """Validated header fields + the stored samples. Reads only the 4 KB header
-    and the npoints-long payload, so oversized or junk-trailed files cost
-    nothing beyond their samples."""
+    """Read a validated header and its declared sample payload.
+
+    Gzip input is consumed sequentially without buffering the whole member.
+    """
+    if _is_gzip(path):
+        try:
+            with gzip.open(path, "rb") as f:
+                h = f.read(HEADER_BYTES)
+                d = _parse_header(h, None, path)
+                off = d.pop("_data_off")
+                gap = off - HEADER_BYTES
+                while gap:
+                    chunk = f.read(min(gap, 64 * 1024))
+                    if not chunk:
+                        raise ValueError(f"{path}: compressed file ends before data offset")
+                    gap -= len(chunk)
+                n = d["npoints"] * d.pop("_itemsize")
+                payload = f.read(n)
+                if len(payload) != n:
+                    raise ValueError(
+                        f"{path}: {len(payload)} data bytes for {d['npoints']} samples "
+                        "— truncated compressed file?"
+                    )
+                if f.read(1):
+                    raise ValueError(f"{path}: unexpected decompressed data after sample payload")
+        except (gzip.BadGzipFile, EOFError, zlib.error) as e:
+            raise ValueError(f"{path}: corrupt or truncated gzip stream: {e}") from e
+        samples = np.frombuffer(payload, dtype=d.pop("_dt"), count=d["npoints"])
+        return d, samples, d.pop("_center")
     with open(path, "rb") as f:
         h = f.read(HEADER_BYTES)
         size = os.fstat(f.fileno()).st_size
@@ -193,8 +504,12 @@ def _parse_header(h, file_size, path):
     if version != 4:
         raise ValueError(f"{path}: header version {version}, expected 4 (V4.0)")
     data_off = _i32(h, 0x04)
-    if not HEADER_BYTES <= data_off <= file_size:
-        raise ValueError(f"{path}: data offset {data_off:#x} not between header end and EOF")
+    if data_off < HEADER_BYTES:
+        raise ValueError(
+            f"{path}: data offset {data_off:#x} is before the {HEADER_BYTES:#x}-byte header end"
+        )
+    if file_size is not None and data_off > file_size:
+        raise ValueError(f"{path}: data offset {data_off:#x} is beyond EOF at {file_size:#x}")
     data_width = h[0x264]  # 0 = 8-bit, 1 = 16-bit
     byte_order = h[0x265]  # 0 = little-endian, 1 = big-endian
     if data_width not in (0, 1) or byte_order not in (0, 1):
@@ -262,7 +577,7 @@ def _parse_header(h, file_size, path):
         raise ValueError(f"{path}: wave_length {npoints}, expected a positive count")
     # wave_length matched the stored data on every genuine capture checked; less
     # data than it claims means a truncated file (see SPEC.md).
-    if file_size - data_off < npoints * itemsize:
+    if file_size is not None and file_size - data_off < npoints * itemsize:
         raise ValueError(
             f"{path}: {file_size - data_off} data bytes for {npoints} "
             f"{itemsize}-byte samples — truncated file?"
@@ -315,12 +630,13 @@ def raw_uint16(path):
 
 
 def read_group(paths, apply_probe=True, strict=True, ref_position=50.0):
-    """Load several per-trace files from one acquisition and return
-    {source: read()-result}, e.g. {'C1': ..., 'C2': ...}. All traces share the
-    time base, so with `strict` everything the time axis is built from
-    (sample_rate, npoints, time_delay, time_div, grid, and the zoom flag —
-    zoom traces use a different axis formula) must match across files (it
-    will, for files from one acquisition); set strict=False to bypass.
+    """Load per-trace files and return ``{source: read()-result}``.
+
+    With ``strict``, everything the shared time axis is built from
+    (sample_rate, npoints, time_delay, time_div, grid, and the zoom flag) must
+    match. Passing this check makes the traces axis-compatible; the V4 format
+    carries no acquisition identifier, so it does not prove common provenance.
+    Set ``strict=False`` to bypass the compatibility check.
     """
     out = {}
     for p in paths:
@@ -334,24 +650,34 @@ def read_group(paths, apply_probe=True, strict=True, ref_position=50.0):
             for k in ("sample_rate", "npoints", "time_delay", "time_div", "grid", "zoom"):
                 if d[k] != ref[k]:
                     raise ValueError(
-                        f"{s} {k}={d[k]} != {ref[k]}; not one acquisition "
+                        f"{s} {k}={d[k]} != {ref[k]}; traces are axis-incompatible "
                         "(pass strict=False to override)"
                     )
     return dict(sorted(out.items()))
 
 
-def find_group(directory, index, pattern=r"_C(\d)_%d\.bin$"):
+def find_group(directory, index, pattern=r"_C(\d)_%d\.bin(?:\.gz)?$"):
     """Return the per-channel file paths for a capture `index` in `directory`,
     sorted by channel. Matches the default SDS814X naming
-    ``..._C<ch>_<index>.bin``. Override `pattern` for other models (must capture
-    the channel number as group 1 and contain %d for the index)."""
+    ``..._C<ch>_<index>.bin[.gz]``. Override `pattern` for other models (must
+    capture the channel number as group 1 and contain %d for the index).
+    Duplicate compressed/plain channels are rejected."""
     rx = re.compile(pattern % index)
-    hits = []
-    for p in glob.glob(os.path.join(directory, "*.bin")):
+    hits = {}
+    candidates = glob.glob(os.path.join(directory, "*.bin")) + glob.glob(
+        os.path.join(directory, "*.bin.gz")
+    )
+    for p in candidates:
         m = rx.search(os.path.basename(p))
         if m:
-            hits.append((int(m.group(1)), p))
-    return [p for _, p in sorted(hits)]
+            channel = int(m.group(1))
+            if channel in hits:
+                raise ValueError(
+                    f"capture {index} channel C{channel} appears in both "
+                    f"{hits[channel]!r} and {p!r}"
+                )
+            hits[channel] = p
+    return [p for _, p in sorted(hits.items())]
 
 
 def _si(x):
@@ -367,11 +693,17 @@ def _main(argv=None):
 
     args = sys.argv[1:] if argv is None else argv
     failed = 0
-    for pat in args or ["*.bin"]:
+    default_scan = not args
+    patterns = args or ["*.bin", "*.bin.gz"]
+    matched = False
+    for pat in patterns:
         paths = sorted(glob.glob(pat))
         if not paths:
-            print(f"{pat}: no files match", file=sys.stderr)
-            failed += 1
+            if not default_scan:
+                print(f"{pat}: no files match", file=sys.stderr)
+                failed += 1
+            continue
+        matched = True
         for p in paths:
             try:
                 d = read(p)
@@ -390,6 +722,9 @@ def _main(argv=None):
                 f"{v.min():.2f}..{v.max():.2f} {u}"
                 f"{'  zoom' if d['zoom'] else ''}{warn}"
             )
+    if default_scan and not matched:
+        print("*.bin[.gz]: no files match", file=sys.stderr)
+        failed += 1
     sys.exit(1 if failed else 0)
 
 

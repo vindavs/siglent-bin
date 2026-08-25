@@ -4,8 +4,12 @@ Every fixture is unmodified scope output. Run with `pytest` or directly:
 `python3 tests/test_siglent_bin.py`.
 """
 
+import glob
+import gzip
 import hashlib
 import os
+import shutil
+import stat
 import struct
 import sys
 import tempfile
@@ -234,6 +238,12 @@ def test_synthetic_format_variants():
         assert len(d["values"]) == len(ref["values"])
         step = abs(ref["vdiv"] / d["code_per_div"] * ref["probe"])  # 1 LSB in volts
         assert float(np.abs(d["values"] - ref["values"]).max()) <= step
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                siglent_bin.write(os.path.join(td, "promoted.bin"), d)
+                raise AssertionError("expected 8-bit write to be rejected")
+            except ValueError as e:
+                assert "only 16-bit" in str(e) and "centred on 128" in str(e)
     finally:
         os.unlink(path)
 
@@ -330,6 +340,26 @@ def test_find_group():
     ]
 
 
+def test_find_group_supports_gzip_and_rejects_duplicate_channels():
+    source = os.path.join(FIX, "known3v_probe1x.bin")
+    with tempfile.TemporaryDirectory() as td:
+        plain = os.path.join(td, "cap_C1_7.bin")
+        compressed = os.path.join(td, "cap_C2_7.bin.gz")
+        shutil.copyfile(source, plain)
+        with open(source, "rb") as src, gzip.open(compressed, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        assert siglent_bin.find_group(td, 7) == [plain, compressed]
+
+        duplicate = os.path.join(td, "cap_C1_7.bin.gz")
+        with open(source, "rb") as src, gzip.open(duplicate, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        try:
+            siglent_bin.find_group(td, 7)
+            raise AssertionError("expected duplicate plain/gzip channel rejection")
+        except ValueError as e:
+            assert "channel C1 appears in both" in str(e)
+
+
 def test_read_group_aligned():
     chans = siglent_bin.read_group(siglent_bin.find_group(FIX, 30))
     assert sorted(chans) == ["C1", "C2", "C3", "C4"]
@@ -379,9 +409,8 @@ def test_malformed_files_rejected():
             os.unlink(path)
 
 
-def test_read_group_rejects_mixed_acquisitions():
-    """Strict read_group compares every field the shared time axis is built from —
-    a file differing in time_div is not from the same acquisition."""
+def test_read_group_rejects_axis_incompatible_files():
+    """Strict read_group rejects files that cannot share one time axis."""
     with open(os.path.join(FIX, "sds814x_C1_30.bin"), "rb") as f:
         blob = bytearray(f.read())
     struct.pack_into("<d", blob, 0x19C, struct.unpack_from("<d", blob, 0x19C)[0] * 2)
@@ -392,7 +421,7 @@ def test_read_group_rejects_mixed_acquisitions():
             siglent_bin.read_group(group)
             raise AssertionError("expected ValueError for mismatched time_div")
         except ValueError as e:
-            assert "time_div" in str(e)
+            assert "time_div" in str(e) and "axis-incompatible" in str(e)
         assert sorted(siglent_bin.read_group(group, strict=False)) == ["C1", "C2"]
     finally:
         os.unlink(path)
@@ -424,6 +453,369 @@ def test_t0_is_a_double_precision_scalar():
     d = siglent_bin.read(os.path.join(FIX, "sds814x_C1_30.bin"))
     assert isinstance(d["t0"], float), type(d["t0"])
     assert float(np.float32(d["t0"])) != d["t0"]
+
+
+def _fixtures():
+    return sorted(glob.glob(os.path.join(FIX, "*.bin")))
+
+
+def test_write_round_trips_every_analog_fixture():
+    """Round-trip the supported fields and samples of every analog fixture."""
+    checked = 0
+    scalars = [
+        "source",
+        "sample_rate",
+        "time_div",
+        "time_delay",
+        "grid",
+        "npoints",
+        "data_width",
+        "vdiv",
+        "voff",
+        "code_per_div",
+        "probe",
+        "unit",
+        "unit_raw",
+        "zoom",
+        "t0",
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        for src in _fixtures():
+            d = siglent_bin.read(src)
+            if not d["source"].startswith("C") or d["zoom"]:
+                continue  # math and zoom are refused by design, covered below
+            out = os.path.join(td, os.path.basename(src))
+            siglent_bin.write(out, d)
+            r = siglent_bin.read(out)
+            for k in scalars:
+                assert r[k] == d[k], f"{os.path.basename(src)}: {k} {d[k]!r} -> {r[k]!r}"
+            assert np.array_equal(r["raw"], d["raw"]), src
+            assert np.array_equal(r["values"], d["values"]), src
+            assert r["values"].dtype == np.float32
+            checked += 1
+    assert checked >= 10, f"only {checked} analog fixtures exercised"
+
+
+def test_write_preserves_an_amps_unit_descriptor():
+    """Preserve an amps descriptor instead of defaulting to volts."""
+    d = siglent_bin.read(os.path.join(FIX, "amps_300ma.bin"))
+    assert d["unit"] == "A"
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "a.bin")
+        siglent_bin.write(out, d)
+        r = siglent_bin.read(out)
+        assert r["unit"] == "A"
+        assert r["unit_raw"] == d["unit_raw"] == (0, 0, 1, 1, 1, 0, 1)
+
+
+def test_write_accepts_a_fetch_shaped_frame():
+    """Accept a live frame with a unit label and integral float code_per_div."""
+    frame = {
+        "source": "C3",
+        "sample_rate": 1e7,
+        "time_div": 1e-2,
+        "time_delay": 5.5e-2,
+        "t0": -1.2e-2,
+        "grid": 10,
+        "npoints": 8,
+        "data_width": 1,
+        "vdiv": 0.2,
+        "voff": -0.5,
+        "code_per_div": 7680.0,  # float, as the live descriptor reports it
+        "probe": 10.0,
+        "unit": "V",
+        "raw": np.array([0, 1, 32767, 32768, 32769, 40000, 65535, 100], dtype=np.uint16),
+    }
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "live.bin")
+        siglent_bin.write(out, frame)
+        r = siglent_bin.read(out)
+        assert r["source"] == "C3"
+        assert r["code_per_div"] == 7680 and isinstance(r["code_per_div"], int)
+        assert r["unit"] == "V"
+        assert r["npoints"] == 8
+        assert np.array_equal(r["raw"], frame["raw"])
+        assert r["vdiv"] == 0.2 and r["voff"] == -0.5 and r["probe"] == 10.0
+        assert np.isclose(r["sample_rate"], 1e7)
+        assert abs(r["t0"] - frame["t0"]) < 1e-17
+        assert r["time_delay"] == frame["t0"] + 0.5 * frame["time_div"] * frame["grid"]
+
+
+def test_write_round_trips_all_eight_channel_slots():
+    """Place C1-C8 in the correct header bank and slot."""
+    base = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        for n in range(1, 9):
+            t = dict(base, source=f"C{n}")
+            out = os.path.join(td, f"c{n}.bin")
+            siglent_bin.write(out, t)
+            assert siglent_bin.read(out)["source"] == f"C{n}"
+
+
+def test_write_refuses_math_and_zoom_traces():
+    for name, needle in (("math_F1.bin", "C1-C8"), ("zoom_Z1.bin", "zoom")):
+        d = siglent_bin.read(os.path.join(FIX, name))
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                siglent_bin.write(os.path.join(td, "x.bin"), d)
+                raise AssertionError(f"expected ValueError writing {name}")
+            except ValueError as e:
+                assert needle in str(e), str(e)
+
+
+def test_write_refuses_an_unknown_unit_rather_than_assuming_volts():
+    """Reject an unknown unit instead of assuming volts."""
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    d.pop("unit_raw")
+    d["unit"] = None
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "u.bin")
+        try:
+            siglent_bin.write(out, d)
+            raise AssertionError("expected ValueError for an unknown unit")
+        except ValueError as e:
+            assert "Volts is not assumed" in str(e)
+        # An explicit unit remains valid.
+        siglent_bin.write(out, d, unit="A")
+        assert siglent_bin.read(out)["unit"] == "A"
+
+
+def test_write_refuses_a_fractional_code_per_div():
+    """Reject a fractional live code_per_div that the int32 header cannot store."""
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    d["code_per_div"] = 7680.5
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            siglent_bin.write(os.path.join(td, "f.bin"), d)
+            raise AssertionError("expected ValueError for a fractional code_per_div")
+        except ValueError as e:
+            assert "integer" in str(e)
+
+
+def test_write_rejects_inconsistent_or_unstorable_samples():
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "x.bin")
+        try:
+            siglent_bin.write(out, dict(d, npoints=d["npoints"] + 1))
+            raise AssertionError("expected ValueError for an npoints mismatch")
+        except ValueError as e:
+            assert "npoints says" in str(e)
+        try:
+            siglent_bin.write(out, dict(d, raw=np.array([70000]), npoints=1))
+            raise AssertionError("expected ValueError for out-of-range samples")
+        except ValueError as e:
+            assert "uint16" in str(e)
+        try:  # `values` passed where `raw` belongs would truncate silently
+            siglent_bin.write(out, dict(d, raw=d["values"]))
+            raise AssertionError("expected ValueError for float samples")
+        except ValueError as e:
+            assert "not its `values`" in str(e)
+
+
+def test_write_canonicalises_reference_position_and_preserves_t0():
+    """The format has no ref-position field. The writer canonicalises the delay
+    to the reader's 50% convention so the file remains self-contained."""
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"), ref_position=30.0)
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "r.bin")
+        siglent_bin.write(out, d)
+        r = siglent_bin.read(out)
+        assert r["t0"] == d["t0"]
+        assert np.array_equal(siglent_bin.time_axis(r), siglent_bin.time_axis(d))
+        assert r["time_delay"] != d["time_delay"]
+
+
+def test_write_validates_every_stored_numeric_before_opening_destination():
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    bad = {
+        "sample_rate": float("nan"),
+        "time_div": 0,
+        "time_delay": float("inf"),
+        "t0": float("nan"),
+        "vdiv": -1,
+        "voff": float("nan"),
+        "probe": 0,
+        "grid": 10.9,
+        "code_per_div": -1,
+        "data_width": 0,
+    }
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "must-not-exist.bin")
+        for key, value in bad.items():
+            try:
+                siglent_bin.write(out, dict(d, **{key: value}))
+                raise AssertionError(f"expected {key}={value!r} to be rejected")
+            except ValueError as e:
+                assert key in str(e) or (key == "t0" and "time_delay" in str(e)), str(e)
+            assert not os.path.exists(out), f"{key} opened the destination before validation"
+
+        try:
+            siglent_bin.write(out, dict(d, code_per_div=1 << 1024))
+            raise AssertionError("expected an overflowing int to be rejected")
+        except ValueError as e:
+            assert "code_per_div" in str(e)
+        assert not os.path.exists(out)
+
+
+def test_write_validates_unit_descriptor_without_coercion():
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    for raw in ((0, 1, 1), (0, 1.5, 1, 0, 1, 0, 1), (0, 1 << 40, 1, 0, 1, 0, 1)):
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                siglent_bin.write(os.path.join(td, "u.bin"), dict(d, unit_raw=raw))
+                raise AssertionError(f"expected unit_raw {raw!r} to be rejected")
+            except ValueError as e:
+                assert "unit_raw" in str(e)
+
+
+def test_write_populates_documented_data_with_unit_descriptors():
+    d = siglent_bin.read(os.path.join(FIX, "amps_300ma.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "units.bin")
+        siglent_bin.write(out, d)
+        with open(out, "rb") as f:
+            h = f.read(siglent_bin.HEADER_BYTES)
+
+        def descriptor(a):
+            return struct.unpack_from("<7i", h, a + 0x0C)
+
+        assert descriptor(0x18) == descriptor(0xB8) == d["unit_raw"]
+        assert descriptor(0x19C) == descriptor(0x1C4) == (0, 0, 1, 0, 1, 1, 1)
+        assert descriptor(0x1F0)[0] == 7  # named unit "Sa"
+
+
+def test_gzip_is_transparent_both_ways():
+    """Read and write gzip through the normal API."""
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        plain = os.path.join(td, "a.bin")
+        gz = os.path.join(td, "a.bin.gz")
+        siglent_bin.write(plain, d)
+        siglent_bin.write(gz, d)
+        assert os.path.getsize(gz) < os.path.getsize(plain)
+        r = siglent_bin.read(gz)
+        assert np.array_equal(r["raw"], d["raw"])
+        assert np.array_equal(r["values"], d["values"])
+        assert r["unit"] == d["unit"] and r["code_per_div"] == d["code_per_div"]
+        # raw_uint16 uses the same gzip path.
+        codes, fs = siglent_bin.raw_uint16(gz)
+        assert np.array_equal(codes, d["raw"]) and fs == d["sample_rate"]
+
+
+def test_gzip_detected_by_magic_not_by_name():
+    """Detect gzip by content rather than filename."""
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        gz = os.path.join(td, "a.bin.gz")
+        siglent_bin.write(gz, d)
+        renamed = os.path.join(td, "no-extension")
+        os.rename(gz, renamed)
+        assert np.array_equal(siglent_bin.read(renamed)["raw"], d["raw"])
+        # Writing is still selected by the destination suffix.
+        misnamed = os.path.join(td, "plain-but-named.bin")
+        siglent_bin.write(misnamed, d)
+        os.rename(misnamed, os.path.join(td, "liar.gz"))
+        assert np.array_equal(siglent_bin.read(os.path.join(td, "liar.gz"))["raw"], d["raw"])
+
+
+def test_gzip_output_is_deterministic_and_does_not_embed_the_path():
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        a = os.path.join(td, "first-name.bin.gz")
+        b = os.path.join(td, "other-name.bin.gz")
+        siglent_bin.write(a, d)
+        siglent_bin.write(b, d)
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            assert fa.read() == fb.read()
+
+
+def test_gzip_corruption_and_trailing_data_are_path_bearing_value_errors():
+    with open(os.path.join(FIX, "known3v_probe1x.bin"), "rb") as f:
+        good = f.read()
+    cases = {}
+    cases["bad-header"] = gzip.compress(b"\x07" + good[1:], mtime=0)
+    member = gzip.compress(good, mtime=0)
+    cases["truncated-member"] = member[:-5]
+    bad_crc = bytearray(member)
+    bad_crc[-8] ^= 0xFF
+    cases["bad-crc"] = bytes(bad_crc)
+    cases["decompressed-tail"] = gzip.compress(good + b"unexpected", mtime=0)
+
+    with tempfile.TemporaryDirectory() as td:
+        for name, blob in cases.items():
+            path = os.path.join(td, name + ".gz")
+            with open(path, "wb") as f:
+                f.write(blob)
+            try:
+                siglent_bin.read(path)
+                raise AssertionError(f"expected {name} to be rejected")
+            except ValueError as e:
+                assert path in str(e), str(e)
+
+
+def test_failed_write_does_not_replace_an_existing_capture():
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "existing.bin.gz")
+        sentinel = b"keep the previous capture"
+        with open(out, "wb") as f:
+            f.write(sentinel)
+
+        original = siglent_bin.gzip.GzipFile
+
+        class FailingGzipFile:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def write(self, _data):
+                raise OSError("simulated full disk")
+
+            def __exit__(self, *_args):
+                return False
+
+        siglent_bin.gzip.GzipFile = FailingGzipFile
+        try:
+            try:
+                siglent_bin.write(out, d)
+                raise AssertionError("expected simulated write failure")
+            except OSError as e:
+                assert "simulated full disk" in str(e)
+        finally:
+            siglent_bin.gzip.GzipFile = original
+        with open(out, "rb") as f:
+            assert f.read() == sentinel
+        assert sorted(os.listdir(td)) == ["existing.bin.gz"]
+
+
+def test_new_write_uses_normal_open_permissions_under_umask():
+    if os.name != "posix":
+        return
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "new.bin")
+        previous = os.umask(0o027)
+        try:
+            siglent_bin.write(out, d)
+        finally:
+            os.umask(previous)
+        assert stat.S_IMODE(os.stat(out).st_mode) == 0o640
+
+
+def test_replacing_a_capture_preserves_its_mode():
+    if os.name != "posix":
+        return
+    d = siglent_bin.read(os.path.join(FIX, "known3v_probe1x.bin"))
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "existing.bin.gz")
+        with open(out, "wb") as f:
+            f.write(b"old")
+        os.chmod(out, 0o604)
+        siglent_bin.write(out, d)
+        assert stat.S_IMODE(os.stat(out).st_mode) == 0o604
 
 
 if __name__ == "__main__":
