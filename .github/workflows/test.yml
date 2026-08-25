@@ -35,8 +35,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install .
       - run: python -W error::ResourceWarning tests/test_siglent_bin.py
+      - run: python -W error::ResourceWarning tests/test_siglent_lan.py
+      - run: python -W error::ResourceWarning tests/test_siglent_sr.py
       - name: smoke test the installed package outside the checkout
         run: cd "$RUNNER_TEMP" && siglent-bin "$GITHUB_WORKSPACE"/tests/fixtures/*.bin
+      - name: smoke test siglent-sr outside the checkout
+        run: |
+          cp "$GITHUB_WORKSPACE"/tests/fixtures/cal_square_1khz.bin "$RUNNER_TEMP"/
+          cd "$RUNNER_TEMP"
+          siglent-sr cal_square_1khz.bin
+          test -f cal_square_1khz.sr
       - name: sdist carries the spec and fixtures
         run: |
           pip install build
