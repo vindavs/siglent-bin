@@ -61,6 +61,32 @@ document) or **[obs]** (established by observation here — treat as inference).
 The digital (LA) enables sit at `digital_on` 0x158 and `d0_d15_on[i]` 0x15c + 4·i, with
 `digital_wave_length` at 0x218 **[doc]** — digital data isn't parsed here.
 
+## Trace contract
+
+The file and LAN readers return ordinary dictionaries described by
+`siglent_bin.Trace`. Their shared waveform fields are:
+
+```text
+source, sample_rate, time_div, time_delay, grid, npoints, data_width,
+vdiv, voff, code_per_div, probe, unit, raw, values, t0
+```
+
+`raw` holds the stored integer codes: 16-bit traces are offset-binary around
+32768 and 8-bit file reads around 128. `values` is float32 in the channel's
+reported unit. `t0` is the time of sample zero; `time_axis(trace)` constructs
+the float64 per-sample axis on demand.
+
+File reads additionally expose `unit_raw`, `zoom`, and the `ref_position` used
+to interpret an original save. Live frames add sequence bookkeeping,
+`ref_position`/`ref_strategy`, and diagnostic `descriptor_stamp`. The latter is
+not acquisition time.
+
+Adapters validate the subset they consume. In particular, `write()` requires a
+finite `t0` and a 16-bit analog trace, while `siglent_sr.write()` requires all
+traces in one session to share `sample_rate`, length, and `t0`. This is the
+canonical schema; bench orchestration may wrap it with experiment provenance
+but should not redefine it.
+
 ### Data-With-Unit (the scalar fields above)
 
 40-byte structure:
@@ -176,9 +202,8 @@ zoom window is horizontal, shared by all channels) while `zoom_vdiv_val` /
 - **[obs]** The window centre sits at **+`zoom_trig_delay_val`**:
   `t0 = delay − td·grid/2`. Verified against byte-located slices of three captures with
   window centres read off the screen (+15 ms and +20 ms at 2 ms/div, +20 ms at
-  5 ms/div) — only the `+delay` sign fits all three. The main axis uses `− time_delay`
-  (verified — see Time axis), so the opposite zoom sign is a real quirk of the format,
-  not a doc error.
+  5 ms/div). This is the 50% reference-position case of the general time-axis
+  expression below.
 - **[obs]** Vertical conversion still uses the source channel's vdiv/offset/code-per-div
   — the stored codes are unchanged from the parent record. (`zoom_vdiv_val` /
   `zoom_vpos_val` describe the zoom display only.)
@@ -195,13 +220,34 @@ F1 = invert(C1+C1) trace positioned at −20 V reproduced −2× the companion C
 
 ## Time axis
 
-**[doc]** `t[i] = −(time_div · hori_div_num / 2) − time_delay + i / sample_rate`.
+⚠️ **[obs]** The time axis needs the scope's horizontal reference position `P`
+in addition to the stored header fields:
 
-**[obs]** The `− time_delay` sign is verified: three trigger-synced sequence segments
-(rising-edge trigger at ~2 V, delay at −100 ms) put the trigger-level crossing at
-samples 4027–4029 of 10 000 — i.e. t = 0 at sample 4000 exactly as the formula places
-it, with the same ~2.05 V at that sample in every segment. A flipped sign would have
-put t = 0 at sample 6000, 200 ms after the edge completed.
+```text
+t0 = -(P/100) * time_div * hori_div_num + time_delay
+t[i] = t0 + i / sample_rate
+```
+
+The expression was verified on three trigger-synchronised captures at `P = 30%`:
+
+| capture | P | span | delay | predicts | trigger observed at |
+|---|---|---|---|---|---|
+| `trigsync_neg100ms.bin` | 30 % | 1000 ms | -100 ms | sample 4000 | 3996 |
+| live, 20 ms record | 30 % | 20 ms | -8 ms | sample 7000 | 7003 |
+| live, 100 ms record | 30 % | 100 ms | 0 | sample 3000 | 3000 |
+
+The V4 header does not store `P`: a scan of every int32 in the 4 KB header found
+only `0x26c = 10`, the horizontal division count. `read()` therefore takes
+`ref_position=` and defaults to screen centre (`50%`), while `fetch()` queries
+the current value. Sample spacing remains valid if the position is unknown, but
+the absolute placement of zero does not. Neither function materialises the full
+axis; `siglent_bin.time_axis()` returns the float64 `t[i]` values.
+
+`write()` canonicalises the stored delay to 50% so a default read reproduces the
+input trace's `t0`; it does not preserve the original front-panel delay/reference
+pair. `:TIMebase:REFerence` selects the strategy (`DELay` or `POSition`); only
+`DELay` has been tested. `siglent_lan` reports the queried strategy as
+`ref_strategy`.
 
 ⚠️ **[obs]** The header stores the **save-time** horizontal settings, not the
 acquisition-time ones — verified directly: re-saving a stopped acquisition after turning
@@ -214,8 +260,8 @@ horizontal controls weren't touched between stop and save.
 
 A/B-verified on the SDS814X by re-saving controlled acquisitions: **[obs]**
 
-- **Interpolation (x vs sinc):** nothing — the two saves were byte-identical. Stored
-  samples are always raw, never interpolated.
+- **Interpolation (x vs sinc):** the two tested saves were byte-identical; no
+  interpolation marker or sample change was observed.
 - **Peak detect:** no header marker (byte-identical header to a normal-mode save at the
   same settings), but the samples interleave a min/max envelope — strong lag-1
   anticorrelation and an even/odd level split on flat regions. Take pairwise min/max of
@@ -227,9 +273,7 @@ A/B-verified on the SDS814X by re-saving controlled acquisitions: **[obs]**
   ordinary single-trace file per segment, plus a text `.awg` replay file. Per-segment
   headers differ only in two undocumented float64s at 0xe00/0xe08 holding the segment's
   min/max value (zero in normal saves); **no per-segment trigger timestamps are
-  stored**, so inter-segment timing is not recoverable from a binary export. (The
-  scope's History panel shows per-segment timestamps at µs resolution, and SCPI
-  `:HISTORy:TIME?` reads them out — they just never reach the .bin.)
+  stored**, so inter-segment timing is not recoverable from a binary export.
 - **Reference (REF) traces:** displaying one changes nothing — the memory_* fields
   stayed zero. REFs export only to the separate `.ref` format (not parsed here).
 - **XY mode / "Save All Channels":** ordinary per-channel time-domain files, identical
@@ -250,3 +294,148 @@ current-clamp probe (the amps case here was a voltage source in amps-display mod
 big-endian and CH5–CH8 code paths are locked by synthetic derivations of real captures
 in the test suite — not the same as real files. Corrections/captures from other SDS
 models welcome.
+
+## Live SCPI path (`:WAVeform:DATA?`) vs saved files
+
+Pulling a waveform over LAN returns the same physical trace through a different
+descriptor with **different conventions**. Sources: the SDS800X HD programming
+guide (EN11F), including its "Read Sequence Waveform Data Example" (p. 782).
+
+- **[doc]** The preamble block is a **346-byte descriptor**, with its own offsets
+  (nothing in common with the 4 KB file header): `data_width` 0x20, `data_order`
+  0x22, points-per-frame 0x74, `data_interval` 0x88 (the echoed
+  `:WAVeform:INTerval` stride), `read_frames` 0x90, `sum_frames` 0x94, `vdiv`
+  0x9c, `voff` 0xa0, `code_per_div` 0xa4 (**float**, not the file's int32),
+  `adc_bit` 0xac, sample `interval` 0xb0 (float seconds), `delay` 0xb4 (double),
+  timebase *index* 0x144 (into an enum, not a value), `probe` 0x148.
+- ⚠️ **[obs]** **`:WAVeform:INTerval` is persistent session state.** It sets a
+  stride (return every Nth point) and persists across connections, so `siglent_lan` writes
+  `1` on every read alongside `STARt`/`POINt`. Measured on the SDS814X HD (fw
+  4.8.12.1.1.6.5) across strides 1/2/7/10:
+  - the descriptor **echoes the stride back at 0x88** (int32) exactly — 1, 2, 7, 10;
+  - the query form `:WAVeform:INTerval?` exists and answers;
+  - the point count at 0x74 keeps reporting the **full record** (1000000) at every stride,
+    while the payload carries `ceil(record/stride)` samples;
+  - the sample `interval` at 0xb0 stays the acquisition spacing (1.0e-07 at 10 MSa/s) and
+    does **not** track the stride.
+
+  On this scope a leftover stride makes the point count and payload disagree, so
+  the short-transfer check trips (`285714 data bytes for 1000000 samples`).
+  Verified by disabling both the write and the echo check with a stride of 7
+  set. The 0x88 check is kept to identify the cause, and
+  because a firmware reporting the *delivered* count at 0x74 would be self-consistent and
+  detectable no other way. A 0 at 0x88 means the field is not populated, not a stride.
+
+  These point-count and stride semantics are specific to the tested SDS814X HD
+  firmware; validate them before applying the checks to another model or release.
+- ⚠️ **[obs]** **`code_per_div` does not change with `:WAVeform:WIDTh`** on the
+  tested firmware: BYTE and WORD both report `code_per_div=7680` and `adc_bit=16`,
+  differing only in `data_width` (0 vs 1) and payload (1 vs 2 bytes per point). A BYTE read
+  scaled by a WORD `code_per_div` is 256x too small. `fetch()` prevents that
+  mismatch by forcing WORD whenever `adc_bit > 8` before reading the scaling
+  preamble.
+- ⚠️ **[obs]** **A zeroed descriptor is not a sequence-mode condition.** It reads all zeroes
+  whenever **no acquisition has completed** — `:TRIGger:MODE NORMal` with nothing on the
+  trigger source sits at `Ready` indefinitely and nothing is addressable, sequence off or
+  on. `:TRIGger:MODE AUTO` force-triggers and makes a record available.
+- ⚠️ **[obs]** **`:TRIGger:STATus?` leaving `Ready` does not mean a record exists.** It
+  reads `Auto` as soon as the mode takes effect, well before a 1 Mpt acquisition has
+  landed; stopping on that reads a zeroed descriptor. Wait for the acquisition (or retry
+  the preamble until it parses) rather than polling the status.
+- ⚠️ **[obs]** **No stable unit field was identified in the live descriptor on
+  this firmware.** Diffing a transfer
+  in amps display mode against one in volts shows a single differing region,
+  `0x0d8..0x0d9` — and two *identical* runs (nothing touched between them) differ
+  in that same region. The bytes around it read as `0x7f...` x86-64 addresses,
+  consistent with uninitialised firmware memory. That region is not treated as
+  stable descriptor data. The unit
+  comes from `:CHANnel<n>:UNIT?` instead, which answers `V` / `A` cleanly (short
+  form `:CHAN<n>:UNIT?` works). On this firmware,
+  `:CHANnel<n>:PROBe:UNIT?` is answered with silence, so the unsupported query
+  costs a socket timeout rather than returning an error.
+- **[obs]** **Changing the unit rescales nothing.** `:CHANnel<n>:SCALe?`,
+  `:OFFSet?` and `:PROBe?` were byte-identical between an amps run and a volts
+  run, so the unit is a label and the vdiv/code_per_div conversion is unaffected
+  by it.
+- ⚠️ **[obs]** On SDS814X HD firmware 4.8.12.1.1.6.5, the 16-byte
+  preamble tail decodes as clock-like date/time fields (seconds float64, then
+  minute/hour/day/month bytes and year int16) but does **not** represent
+  acquisition time. Acquisitions did not move it, it did not continuously
+  follow the running clock, and other operations could update it. Its writer
+  remains unresolved. `siglent_lan` therefore exposes it only as diagnostic
+  `descriptor_stamp`; consumers must not use it as a capture or trigger time.
+  Per-segment timing is not recovered from this field, and `.bin` exports do not
+  contain it.
+- **[doc]** **The manual documents no RTC.** Section 30.2.5 says: *"The SDS800X HD does not have RTC clock, which can be
+  synchronized through the NTP protocol or manually set for Date/Time."* The clock resets
+  across boots on the tested unit. `:SYSTem:DATE` / `:SYSTem:TIME` are writable over SCPI;
+  `siglent_lan.sync_clock()` exposes that operation explicitly and `fetch()` never calls it.
+- **[obs]** **This HD tail differs from scopehal's classic LeCroy TRIGTIME
+  layout.** scopehal interprets the 16 bytes as two float64 values; the tested HD
+  descriptor instead yields the date/time-shaped fields described above. Treat
+  these as distinct descriptor layouts rather than interchangeable records.
+- **[doc]** Samples arrive as **signed** integers centred on 0 (the vendor example
+  unpacks `h`), where a saved file stores offset-binary uint16 centred on 32768.
+  `siglent_lan` shifts by +32768 so both paths hand back the same convention.
+- ⚠️ **[obs]** `:WAVeform:SEQuence` does **not** behave as documented here. The doc
+  says `value1 = 0` returns every frame that fits one transfer, with `value2`
+  walking the remainder. On this scope:
+  - `value1 = 0` **collapses `sum_frames` to 1** and returns a single frame -- it
+    discards the run's addressability rather than bulk-transferring it;
+  - a `value2` other than `1` (e.g. the documented `2,2` for a second frame)
+    **wedges the instrument** -- it stops answering and needs `*CLS` to recover;
+  - `value1 = <n>, value2 = 1` selects frame *n* correctly and leaves
+    `sum_frames` intact; this is the form `siglent_lan` uses.
+
+  So a sequence run is read frame-by-frame, not in one bulk transfer. Repeated
+  reads were non-destructive in the tested runs.
+- ⚠️ **[obs]** **A completed sequence run leaves the scope at `Ready`, not `Stop`,
+  and its segment buffer is unaddressable in that state** -- the whole descriptor
+  reads zero (no points, no `code_per_div`, no `adc_bit`) and `:HISTORy:FRAMe?`
+  reads 0. On the tested model/firmware, sending `:TRIGger:STOP` before transfer
+  made the completed buffer addressable; `siglent_lan.fetch()` therefore does so
+  by default. Without that step, re-arming and refilling were observed instead.
+- **[obs]** Block responses carry a **response header in sequence mode** --
+  `:WAVeform:PREamble?` answers `C1:WF #9000000362...` with sequence on and a bare
+  `#9...` with it off. Anything before the `#` must be skipped, not treated as an
+  error. Its optional terminator may arrive in a later TCP packet; text reads
+  discard an empty framing line so it cannot shift subsequent responses.
+- ⚠️ **[obs]** **The delay field at 0xb4 is referred to screen centre.** Measured
+  on the SDS814X HD (fw 4.8.12.1.1.6.5) over 4 reference
+  positions x 3 delays, 12/12 exact:
+
+      desc_delay = :TIMebase:DELay? + (0.5 - ref_position/100) * time_div * grid
+
+  `:TIMebase:DELay?` is referred to the *reference position*; 0xb4 is referred to centre. The
+  two axes are therefore identical, and both of these give the same `t0` at every setting:
+
+      ours:   t0 = delay - (ref_position/100) * time_div * grid
+      centre: t0 = desc_delay - time_div * grid / 2
+
+- ⚠️ **[obs]** **The timebase index at 0x144 was not portable on the tested model.** It read 20 — whose enum
+  entry is 500 us — while the scope reported 1 ms/div. The guide itself says the enumeration
+  is model-dependent (p.756, Table 2: "Different models have different time base
+  enumeration"). `siglent_lan` therefore takes the timebase from
+  `:TIMebase:SCALe?` rather than applying a cross-model enum mapping.
+- **[obs]** The vendor's live axis formula (`t = -tdiv*grid/2 + i*interval + delay`) *adds*
+  the delay term where the saved-file formula subtracts it. With the centre-referred reading
+  above, the vendor's form is the consistent one for 0xb4 and the file's form is the
+  consistent one for `:TIMebase:DELay?`. `descriptor_audit()` reports the queried
+  reference position, the expected centre-referred delay, their difference and
+  match result, along with `data_interval`.
+- **[obs]** The descriptor's sample `interval` was finite in the tested normal and
+  sequence captures. `fetch()` nevertheless prefers `:ACQuire:SRATe?` and accepts
+  the descriptor value only as a validated fallback.
+- **[obs]** `code_per_div` is a **float32** here (0xa4); the file header stores it
+  as a signed int32. Sample `interval` (0xb0) is float32 too, so deriving the rate
+  from it lands ~2.5 ppb off the file header's float64 value -- hence the
+  `:ACQuire:SRATe?` query.
+- **[obs]** **End-to-end checked against a saved file.** With the scope stopped on
+  one acquisition, live C1/C2/C3 transfers and saved files had identical raw
+  samples. Converted values agreed within float32 rounding and time axes within
+  float64 roundoff. This validates the signed-to-offset-binary conversion and
+  axis convention on the tested model/firmware.
+
+Model- and firmware-specific capture setup and measurement practice are kept in
+the bench SDS800X HD note,
+not in this file-format specification.
