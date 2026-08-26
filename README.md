@@ -112,8 +112,11 @@ pair. The calling experiment must also record live-sequence bookkeeping and
 other capture provenance.
 
 The output preserves the trace fields understood by this package, not every
-byte of the scope's original header. Importing generated files back into a scope
-or third-party reader has not yet been verified.
+byte of the scope's original header. The tested SDS814X HD has no Binary recall
+option; its Reference recall rejected an untouched scope-written `.bin` as an
+illegal format. There is therefore no valid front-panel import control for a
+generated `.bin` on this model/firmware. Third-party reader compatibility has
+not yet been verified.
 
 Gzip is transparent in both directions: give `write()` a `.gz` path and it
 compresses; `read()` and `raw_uint16()` sniff the magic bytes, so a `.bin.gz`

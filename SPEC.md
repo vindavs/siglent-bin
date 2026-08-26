@@ -276,6 +276,24 @@ A/B-verified on the SDS814X by re-saving controlled acquisitions: **[obs]**
   stored**, so inter-segment timing is not recoverable from a binary export.
 - **Reference (REF) traces:** displaying one changes nothing — the memory_* fields
   stayed zero. REFs export only to the separate `.ref` format (not parsed here).
+  In one same-acquisition comparison, the V4 `.bin` and live SCPI transfer held
+  1,000,000 identical raw samples, while the 7,464-byte `.ref` contained a
+  3,000-value waveform region whose transition was at the same relative horizontal
+  position. On the scope, the reference retained vertical scale and offset and
+  could be scaled or moved vertically. It retained the 100 ms horizontal span,
+  but displayed it as -50 to +50 ms around screen centre. The matched live trace
+  used a 30% horizontal reference and ran from -30 to +70 ms; its edge remained
+  near 30% in the reference overlay rather than moving to the displayed zero.
+  Acquisition pan and zoom did not move the overlay. This establishes that
+  `.ref` is a reduced display-oriented representation with vertical and span
+  metadata, not a V4 wrapper or a trigger-relative archive; it does not establish
+  the raw-coordinate amplitude conversion or full field layout.
+- **Binary recall:** the tested SDS814X HD Save/Recall menu offered Setup,
+  Reference, Factory Default, and Security Erase, but no Binary recall. Reference
+  recall rejected an untouched scope-written V4 `.bin` with “File format is
+  illegal.” A generated file was not tried because the native control already
+  established that this is not a `.bin` import path. This says nothing about
+  other models or third-party readers.
 - **XY mode / "Save All Channels":** ordinary per-channel time-domain files, identical
   to saving each channel individually. No UI path produced the doc's sequential
   multi-trace single file.
