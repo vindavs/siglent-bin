@@ -13,6 +13,7 @@ import stat
 import struct
 import sys
 import tempfile
+import warnings
 
 import numpy as np
 
@@ -26,6 +27,8 @@ import siglent_bin  # noqa: E402
 def test_read_single_channel():
     d = siglent_bin.read(os.path.join(FIX, "sds814x_C1_30.bin"))
     assert d["source"] == "C1"
+    assert d["digital_enabled"] is False
+    assert d["unsupported_sources"] == ()
     assert d["sample_rate"] == 20000.0
     assert d["npoints"] == 100000
     assert d["data_width"] == 1  # 16-bit
@@ -397,6 +400,7 @@ def test_malformed_files_rejected():
         "zero grid": good[:0x26C] + struct.pack("<i", 0) + good[0x270:],
         "invalid zoom_switch": good[:0xAF4] + struct.pack("<i", 2) + good[0xAF8:],
         "invalid enable flag": good[:0x08] + struct.pack("<i", 2) + good[0x0C:],
+        "invalid digital enable flag": good[:0x158] + struct.pack("<i", 2) + good[0x15C:],
     }
     for what, blob in cases.items():
         path = _tmp_bin(blob)
@@ -728,6 +732,95 @@ def test_gzip_output_is_deterministic_and_does_not_embed_the_path():
         siglent_bin.write(b, d)
         with open(a, "rb") as fa, open(b, "rb") as fb:
             assert fa.read() == fb.read()
+
+
+def test_mixed_native_digital_is_warned_and_skipped_for_plain_and_gzip():
+    """Unsupported native logic must not hide an otherwise usable analog trace.
+
+    This synthetic payload tests detection and skip policy only; it does not
+    validate the documented digital encoding.
+    """
+    source = os.path.join(FIX, "sds814x_C1_30.bin")
+    with open(source, "rb") as f:
+        blob = bytearray(f.read())
+    reference = siglent_bin.read(source)
+    struct.pack_into("<i", blob, 0x158, 1)  # digital_on
+    struct.pack_into("<i", blob, 0x15C, 1)  # D0 enabled
+    struct.pack_into("<i", blob, 0x168, 1)  # D3 enabled
+    struct.pack_into("<i", blob, 0x218, 16)  # documented digital point count
+    blob.extend(b"\xaa\x55\x0f\xf0")  # opaque unsupported payload
+
+    with tempfile.TemporaryDirectory() as td:
+        plain = os.path.join(td, "mixed.bin")
+        compressed = os.path.join(td, "mixed.bin.gz")
+        with open(plain, "wb") as f:
+            f.write(blob)
+        with open(compressed, "wb") as f:
+            f.write(gzip.compress(blob, mtime=0))
+
+        for path in (plain, compressed):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                d = siglent_bin.read(path)
+            assert np.array_equal(d["raw"], reference["raw"])
+            assert d["digital_enabled"] is True
+            assert d["unsupported_sources"] == ("D0", "D3")
+            assert len(caught) == 1
+            assert issubclass(caught[0].category, siglent_bin.UnsupportedTraceWarning)
+            assert caught[0].filename == __file__
+            message = str(caught[0].message)
+            assert path in message and "D0, D3" in message and "returning C1" in message
+
+        # Unsupported per-channel metadata must not make the analog trace unusable.
+        unknown_flags = bytearray(blob)
+        struct.pack_into("<i", unknown_flags, 0x15C, 2)
+        struct.pack_into("<i", unknown_flags, 0x168, 0)
+        unknown_path = os.path.join(td, "mixed-unknown-flags.bin")
+        with open(unknown_path, "wb") as f:
+            f.write(unknown_flags)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            d = siglent_bin.read(unknown_path)
+        assert d["unsupported_sources"] == ()
+        assert len(caught) == 1
+        assert "native digital data is enabled" in str(caught[0].message)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            samples, sample_rate = siglent_bin.raw_uint16(compressed)
+        assert np.array_equal(samples, reference["raw"])
+        assert sample_rate == reference["sample_rate"]
+        assert len(caught) == 1
+        assert issubclass(caught[0].category, siglent_bin.UnsupportedTraceWarning)
+        assert caught[0].filename == __file__
+
+        corrupt = bytearray(gzip.compress(blob, mtime=0))
+        corrupt[-8] ^= 0xFF  # gzip CRC; the ignored tail must still be drained and checked
+        corrupt_path = os.path.join(td, "mixed-corrupt.bin.gz")
+        with open(corrupt_path, "wb") as f:
+            f.write(corrupt)
+        try:
+            siglent_bin.read(corrupt_path)
+            raise AssertionError("expected corrupt mixed gzip to be rejected")
+        except ValueError as e:
+            assert corrupt_path in str(e)
+
+
+def test_digital_only_capture_is_unsupported():
+    with open(os.path.join(FIX, "sds814x_C1_30.bin"), "rb") as f:
+        blob = bytearray(f.read())
+    struct.pack_into("<i", blob, 0x08, 0)  # C1 off
+    struct.pack_into("<i", blob, 0x158, 1)  # digital_on
+    struct.pack_into("<i", blob, 0x15C, 1)  # D0 enabled
+    path = _tmp_bin(bytes(blob))
+    try:
+        try:
+            siglent_bin.read(path)
+            raise AssertionError("expected digital-only capture to be unsupported")
+        except NotImplementedError as e:
+            assert path in str(e) and "D0" in str(e) and "no analog/math trace" in str(e)
+    finally:
+        os.unlink(path)
 
 
 def test_gzip_corruption_and_trailing_data_are_path_bearing_value_errors():

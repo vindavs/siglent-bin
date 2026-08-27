@@ -59,7 +59,10 @@ document) or **[obs]** (established by observation here — treat as inference).
 | sample data | 0x1000 | uint16[] / uint8[] | [doc] | offset-binary — see encoding below |
 
 The digital (LA) enables sit at `digital_on` 0x158 and `d0_d15_on[i]` 0x15c + 4·i, with
-`digital_wave_length` at 0x218 **[doc]** — digital data isn't parsed here.
+`digital_wave_length` at 0x218 **[doc]**. Digital payload encoding is not implemented or
+verified. A mixed file returns its supported analog/math trace, warns, and exposes the
+omitted D-channel names in `unsupported_sources`; a digital-only file is rejected. Gzip
+input drains an omitted payload to verify the stream CRC without interpreting its bytes.
 
 ## Trace contract
 
@@ -76,8 +79,10 @@ vdiv, voff, code_per_div, probe, unit, raw, values, t0
 reported unit. `t0` is the time of sample zero; `time_axis(trace)` constructs
 the float64 per-sample axis on demand.
 
-File reads additionally expose `unit_raw`, `zoom`, and the `ref_position` used
-to interpret an original save. Live frames add sequence bookkeeping,
+File reads additionally expose `unit_raw`, `zoom`, the `ref_position` used to
+interpret an original save, and `digital_enabled` / `unsupported_sources` for native
+digital data detected but not returned; no digital sample encoding is inferred from
+these fields. Live frames add sequence bookkeeping,
 `ref_position`/`ref_strategy`, and diagnostic `descriptor_stamp`. The latter is
 not acquisition time.
 
@@ -170,7 +175,8 @@ Two departures from a naive reading of the source doc:
 
 The formula holds across vertical settings from 20 mV/div to a 3.15 V/div-effective
 vernier, including a window that excludes 0 V entirely (large offset term). For
-digital/threshold decoding you don't need volts — threshold the raw uint16.
+threshold/PWM decoding of an analog trace you don't need volts — threshold the raw
+uint16.
 
 ## Channel invert & channel name
 
@@ -306,11 +312,12 @@ calibrated against known 0/3/4.5/5 V references — including a vernier (non-1-2
 and a window excluding 0 V — and channel-invert, zoom (Z1), math (F1), sequence-segment,
 peak-detect and XY saves exercised. Still **not exercised** by any file on hand, so implemented-from-doc-only or
 untested: 8-bit (`data_width = 0`), big-endian (`byte_order = 1`), CH5–CH8 (8-channel
-models), digital (D0–D15) data, reference/memory waveforms, Average/ERES traces (math
-operators on this model, so expected to save as ordinary F-trace files), and a real
+models), digital (D0–D15) payload decoding, reference/memory waveforms, Average/ERES
+traces (math operators on this model, so expected to save as ordinary F-trace files), and a real
 current-clamp probe (the amps case here was a voltage source in amps-display mode). The 8-bit,
 big-endian and CH5–CH8 code paths are locked by synthetic derivations of real captures
-in the test suite — not the same as real files. Corrections/captures from other SDS
+in the test suite — not the same as real files. Digital detection/warning behavior is
+also tested synthetically; its payload remains opaque. Corrections/captures from other SDS
 models welcome.
 
 ## Live SCPI path (`:WAVeform:DATA?`) vs saved files

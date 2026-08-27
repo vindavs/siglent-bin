@@ -33,6 +33,7 @@ import re
 import secrets
 import stat
 import struct
+import warnings
 import zlib
 from collections.abc import Mapping
 from numbers import Real
@@ -74,6 +75,12 @@ class Trace(TypedDict, total=False):
     sequence: bool
     ref_strategy: str
     desc_delay: float
+    digital_enabled: bool
+    unsupported_sources: tuple[str, ...]
+
+
+class UnsupportedTraceWarning(UserWarning):
+    """A capture also contains enabled traces this package did not return."""
 
 
 def _open_atomic_temp(destination):
@@ -372,6 +379,9 @@ def read(path, apply_probe=True, ref_position=50.0):
         unit          -> unit of the values, decoded from the descriptor
                          ('V', 'A', ...),
         unit_raw      -> the raw 7-int unit descriptor,
+        digital_enabled -> whether the file also declares native digital data,
+        unsupported_sources -> enabled native digital channels omitted from
+                               this result,
         zoom          -> True for a zoom (Z) save; the time axis then comes from
                          the stored zoom timebase (held in time_div/time_delay),
         ref_position  -> the value used to place t = 0 (echoed back),
@@ -404,6 +414,11 @@ def read(path, apply_probe=True, ref_position=50.0):
     field, so probe is 1.0; their values were verified against a math of known
     inputs to ~1 mV. For a pure threshold/PWM decode skip `values` and use
     `raw` / `raw_uint16()`.
+
+    If native digital channels accompany the analog/math trace, they are skipped
+    and an UnsupportedTraceWarning is emitted; ``unsupported_sources`` names the
+    omitted channels. A digital-only file raises NotImplementedError because no
+    supported trace remains to return.
 
     Raises ValueError for a file that isn't a parseable V4.0 capture (short or
     truncated file, wrong version, out-of-range header fields).
@@ -453,10 +468,24 @@ def _is_gzip(path):
         return False
 
 
+def _warn_unsupported(path, d):
+    if not d["digital_enabled"]:
+        return
+    names = ", ".join(d["unsupported_sources"])
+    sources = f" ({names})" if names else ""
+    warnings.warn(
+        f"{path}: native digital data{sources} is enabled but not parsed; returning {d['source']} "
+        "and skipping the remaining payload",
+        UnsupportedTraceWarning,
+        stacklevel=4,
+    )
+
+
 def _load(path):
-    """Read a validated header and its declared sample payload.
+    """Read a validated header and its declared analog/math sample payload.
 
     Gzip input is consumed sequentially without buffering the whole member.
+    Unsupported native digital data is drained but not interpreted.
     """
     if _is_gzip(path):
         try:
@@ -477,11 +506,15 @@ def _load(path):
                         f"{path}: {len(payload)} data bytes for {d['npoints']} samples "
                         "— truncated compressed file?"
                     )
-                if f.read(1):
+                extra = f.read(64 * 1024)
+                if extra and not d["digital_enabled"]:
                     raise ValueError(f"{path}: unexpected decompressed data after sample payload")
+                while extra:  # drain unsupported payload and verify the gzip trailer/CRC
+                    extra = f.read(64 * 1024)
         except (gzip.BadGzipFile, EOFError, zlib.error) as e:
             raise ValueError(f"{path}: corrupt or truncated gzip stream: {e}") from e
         samples = np.frombuffer(payload, dtype=d.pop("_dt"), count=d["npoints"])
+        _warn_unsupported(path, d)
         return d, samples, d.pop("_center")
     with open(path, "rb") as f:
         h = f.read(HEADER_BYTES)
@@ -490,6 +523,7 @@ def _load(path):
         f.seek(d.pop("_data_off"))
         payload = f.read(d["npoints"] * d.pop("_itemsize"))
         samples = np.frombuffer(payload, dtype=d.pop("_dt"), count=d["npoints"])
+    _warn_unsupported(path, d)
     return d, samples, d.pop("_center")
 
 
@@ -520,10 +554,27 @@ def _parse_header(h, file_size, path):
         _i32(h, 0x404 + 4 * c) for c in range(4)
     ]  # CH5-8 (8ch models)
     math_on = [_i32(h, 0x280 + 4 * m) for m in range(4)]
+    digital_on = _i32(h, 0x158)
     bad = [v for v in ch_on + math_on if v not in (0, 1)]
     if bad:
         raise ValueError(f"{path}: channel/math enable flags must be 0 or 1, got {bad}")
+    if digital_on not in (0, 1):
+        raise ValueError(f"{path}: digital enable flag must be 0 or 1, got {digital_on}")
+    digital_flags = [_i32(h, 0x15C + 4 * i) for i in range(16)] if digital_on else []
+    # These flags only improve the warning. Their behavior has not been verified
+    # on a real MSO file, so unexpected values do not invalidate the analog trace.
+    digital_sources = (
+        tuple(f"D{i}" for i, enabled in enumerate(digital_flags) if enabled)
+        if all(v in (0, 1) for v in digital_flags)
+        else ()
+    )
     on = [f"C{c + 1}" for c in range(8) if ch_on[c]] + [f"F{m + 1}" for m in range(4) if math_on[m]]
+    if not on and digital_on:
+        names = ", ".join(digital_sources) or "native digital channels"
+        raise NotImplementedError(
+            f"{path}: {names} enabled, but native digital data is not parsed and "
+            "there is no analog/math trace to return"
+        )
     if len(on) != 1:
         raise NotImplementedError(
             f"{path}: {len(on)} traces enabled {on}. The SDS800X HD writes one "
@@ -614,6 +665,8 @@ def _parse_header(h, file_size, path):
         "unit": unit,
         "unit_raw": unit_raw,
         "zoom": zoom,
+        "digital_enabled": bool(digital_on),
+        "unsupported_sources": digital_sources,
         "_dt": dt,
         "_center": center,
         "_itemsize": itemsize,

@@ -168,8 +168,11 @@ with the reported `--decimate N` factor after checking that narrow pulses surviv
 
 - Reads analog channels (`C1`–`C4`, plus format-documented `C5`–`C8`), math traces
   (`F1`–`F4`), and zoom (`Z1`–`Z4`) saves. Zoom saves slice the parent record and use
-  the stored zoom timebase. Digital (D0–D15) channels and reference waveforms are not
-  parsed.
+  the stored zoom timebase. Native digital (D0–D15) data is not decoded: when it
+  accompanies a supported trace, the reader returns that trace, emits
+  `UnsupportedTraceWarning`, and lists the omitted channels in
+  `unsupported_sources`; a digital-only file is unsupported. Reference waveforms
+  are also not parsed.
 - Absolute time needs the scope's horizontal reference position, which the header
   does not record: pass `ref_position=` (default 50 = screen centre) to `read()`
   if the scope was set elsewhere. Relative timing is unaffected either way, and
@@ -183,8 +186,8 @@ with the reported `--decimate N` factor after checking that narrow pulses surviv
   acquisition-time, horizontal delay (see SPEC.md).
 - The SDS814X HD writes 16-bit little-endian. The format-defined 8-bit
   (`data_width=0`) and big-endian paths are implemented but not produced by this scope.
-- For digital/threshold decoding, use `raw`/`raw_uint16` and skip the volts
-  conversion entirely.
+- For threshold/PWM decoding of a returned analog trace, use `raw`/`raw_uint16`
+  and skip the volts conversion entirely.
 
 ## Verification
 
