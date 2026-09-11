@@ -1,214 +1,256 @@
 # siglent-bin
 
-A dependency-light (numpy-only) Python toolkit for **Siglent "Binary Format
-V4.0"** waveform files and **SDS800X HD** live capture. It reads scope `.bin`
-files, writes canonical archives, acquires segmented SCPI/TCP waveforms, and
-exports traces to sigrok srzip.
+A lightweight toolkit for working with Siglent SDS800X HD scopes:
 
-The reader handles two format traps: 16-bit samples are **offset-binary uint16**
-(a signed-int16 read inverts some traces), and Siglent's conversion document has
-the offset-term sign wrong. [SPEC.md](SPEC.md) records field offsets, the
-conversion formula, and every claim's documented or observed basis.
+- Read Siglent Binary Format V4.0 waveform files
+- Capture SDS800X HD waveforms over SCPI/TCP
+- Write canonical archives
+- Export traces to sigrok
+
+The package has one runtime dependency: NumPy.
+
+The saved-file reader is built around three details that are easy to get wrong:
+
+- SDS800X HD 16-bit samples are offset-binary `uint16`, centred at `32768`.
+- The voltage conversion uses `- vert_offset` and applies the probe factor to the whole expression.
+- The time axis adds `time_delay`; its absolute position also needs the horizontal reference position, which the file does not store.
+
+The format fields, conversion formula, and evidence behind the corrections are in [SPEC.md](SPEC.md).
 
 ## Install
 
-The package requires Python 3.11+ and numpy. Install it directly from GitHub:
-
-```
+```sh
 pip install git+https://github.com/vindavs/siglent-bin
 ```
 
-## Usage
+Python 3.11 or newer is required.
+
+## Read a saved waveform
 
 ```python
 import siglent_bin
 
-# One file = one trace
 d = siglent_bin.read("SDS814X_HD_Binary_C1_30.bin")
-d["values"]  # numpy float32 array — volts (amps if the channel was in amps display)
-d["unit"]  # 'V' or 'A'
-d["t0"]  # seconds, time of sample 0 relative to the trigger
-siglent_bin.time_axis(d)  # seconds, float64, the full per-sample time axis
-d["sample_rate"]  # Sa/s
-d["source"]  # 'C1'..'C8', or 'F1'..'F4' for a math trace
 
-# Just the raw samples for a threshold/PWM decoder (offset-binary uint16, correct polarity)
-samples, fs = siglent_bin.raw_uint16("cap.bin")
-
-# A multi-channel acquisition is saved as several files sharing an index.
-paths = siglent_bin.find_group("/Volumes/SCOPE", 30)  # ..._C1_30.bin, ..._C2_30.bin, ...
-chans = siglent_bin.read_group(paths)  # {'C1': {...}, 'C2': {...}, ...}, aligned
+values = d["values"]              # float32, in the trace's unit
+unit = d["unit"]                  # usually "V" or "A"
+t0 = d["t0"]                      # time of sample 0, in seconds
+axis = siglent_bin.time_axis(d)   # float64 time axis
+raw = d["raw"]                    # stored integer codes
+rate = d["sample_rate"]           # samples per second
+source = d["source"]              # C1-C8 or F1-F4
 ```
 
-### Live capture over LAN
+`values` uses this conversion:
 
-`siglent_lan` reads waveforms over a raw socket (port 5025) and returns the same
-dict shape as `read()`. For sequence (segmented) acquisition, `fetch()` returns
-every segment of a run in one call.
+```text
+((code - center) * vdiv / code_per_div - voff) * probe
+```
+
+`center` is `32768` for a 16-bit file and `128` for an 8-bit file.
+Use `raw` or `raw_uint16()` for threshold and PWM decoding when you do not need calibrated values.
+
+```python
+samples, rate = siglent_bin.raw_uint16("cap.bin")
+```
+
+A multi-channel SDS814X acquisition is saved as one file per channel.
+Load those files together and check that their timing fields match:
+
+```python
+paths = siglent_bin.find_group("/Volumes/SCOPE", 30)
+channels = siglent_bin.read_group(paths)
+# {"C1": {...}, "C2": {...}, ...}
+```
+
+`read_group()` does not prove that files came from the same acquisition because the V4 header has no acquisition identifier.
+Use `strict=False` only when you want to bypass its axis-compatibility check.
+
+### Absolute time
+
+The V4 header does not store the horizontal reference position.
+`read()` therefore accepts `ref_position` in percent and defaults to `50`, the screen centre.
+
+```python
+d = siglent_bin.read("cap.bin", ref_position=30)
+```
+
+The time axis is:
+
+```text
+t0  = time_delay - (ref_position / 100) * time_div * grid
+t[i] = t0 + i / sample_rate
+```
+
+Relative timing remains correct when the reference position is unknown.
+The `read()` argument is also applied to zoom records, but non-centre zoom references have not been tested.
+
+The scope stores the horizontal settings that existed when the file was saved.
+If the delay or reference controls changed after acquisition and before saving, the stored absolute timing can be wrong.
+
+## Capture over LAN
+
+`siglent_lan` reads waveforms from port `5025` and returns the same fields as `siglent_bin.read()` where they apply.
 
 ```python
 import siglent_lan
 
-frames = siglent_lan.fetch("192.168.1.50", "C1")  # list, one dict per frame
-frames[0]["values"], frames[0]["t0"]
-frames[0]["descriptor_stamp"]  # clock-like diagnostic; not acquisition time
+frames = siglent_lan.fetch("192.168.1.50", "C1")
+frame = frames[0]
+frame["values"], frame["t0"]
 
-chans = siglent_lan.fetch_group("192.168.1.50")  # {'C1': [...], 'C2': [...]}
+channels = siglent_lan.fetch_group("192.168.1.50")
+# {"C1": [frame, ...], "C2": [frame, ...]}
 ```
 
-```
-$ siglent-lan 192.168.1.50 C1 C2
-```
+Sequence acquisitions return one frame per list item.
+`fetch()` reads frames individually because the tested SDS814X firmware does not reliably support bulk sequence reads.
+It sends `:TRIGger:STOP` before reading by default so a completed sequence buffer becomes addressable.
+Pass `stop=False` when a running acquisition must not be disturbed.
 
-On the tested SDS814X firmware, a completed sequence at `Ready` returned a
-zeroed, unaddressable descriptor. `:TRIGger:STOP` made the buffer readable, so
-`fetch()` stops first by default. `stop=False` preserves a running acquisition,
-but a completed sequence may then be unaddressable.
+Live samples arrive as signed integers, unlike saved-file samples.
+The LAN reader normalises them to the saved-file `raw` convention, so live and saved traces can be compared directly.
 
-Siglent documents this family as having no RTC. `siglent_lan.sync_clock(host)`
-sets the session clock from the host, and `siglent-lan HOST --sync-clock` does
-the same from the CLI. It is opt-in: `fetch()` never changes the clock. Clock
-state is capture provenance and does not affect trigger-relative waveform time.
+The live descriptor has no stable unit field on the tested firmware.
+For channel sources, the reader queries `:CHANnel<n>:UNIT?` and returns the result as `unit`.
+Math and zoom sources have no equivalent query and return `unit=None`.
 
-The channel unit (`'V'` or `'A'`) comes from `:CHANnel<n>:UNIT?`; unlike the
-saved-file header, the tested firmware's 346-byte live descriptor has no stable
-unit field. Math and zoom traces have no such query, so their `unit` is None
-rather than an assumed `'V'`.
+`descriptor_stamp` is exposed for diagnostics only.
+It resembles a date/time on the tested firmware but is not acquisition time.
 
-The descriptor's clock-like record is exposed as `descriptor_stamp` for
-diagnostics. On the tested firmware it is not acquisition time and its writer is
-unknown. A live fetch and saved file from the same stopped acquisition had
-identical raw samples; converted values and axes agreed within float precision.
-Live samples are signed, not offset-binary, and the descriptor timebase index is
-model-dependent, so the live path normalises codes and queries timebase over
-SCPI. See [SPEC.md](SPEC.md).
-
-Or as a CLI summary:
-
-```
-$ siglent-bin *.bin        # pip-installed; `python -m siglent_bin` also works
-cap_C1_30.bin: C1  20 kSa/s  100 kpts  0.5 V/div  probe 10x  -0.12..3.31 V
-```
-
-### Writing a .bin
-
-`siglent_bin.write()` creates a canonical V4-compatible archive from a 16-bit
-analog `read()` result or live `fetch()` frame.
+Siglent documents this scope family as having no RTC.
+Synchronise its session clock explicitly when needed:
 
 ```python
+siglent_lan.sync_clock("192.168.1.50")
+```
+
+`fetch()` never changes the scope clock.
+
+The command-line equivalent is:
+
+```sh
+siglent-lan 192.168.1.50 C1 C2
+siglent-lan 192.168.1.50 --sync-clock
+```
+
+## Write a canonical `.bin`
+
+`siglent_bin.write()` accepts one analog `read()` result or one live `fetch()` frame.
+It writes a 16-bit V4 archive using the trace's integer `raw` samples, so float32 rounding in `values` is not written back.
+
+```python
+import siglent_bin
+import siglent_lan
+
 frames = siglent_lan.fetch("192.168.1.50", "C1")
 siglent_bin.write("cap_C1.bin", frames[0])
 back = siglent_bin.read("cap_C1.bin")
 ```
 
-Samples come from `raw`, so float32 `values` rounding does not reach the file.
-The writer validates every stored field and refuses unsupported 8-bit, math,
-zoom, fractional-scale, or unknown-unit input instead of guessing.
+The writer rejects math and zoom traces, 8-bit data, fractional `code_per_div`, and unknown units.
+It validates the stored fields instead of guessing missing values.
 
-The format cannot store the horizontal reference position. The writer
-canonicalises the stored delay to a 50% reference, preserving the input trace's
-`t0` on a default read but discarding the original front-panel delay/reference
-pair. The calling experiment must also record live-sequence bookkeeping and
-other capture provenance.
+The format has no horizontal reference-position field.
+The writer canonicalises the delay to a 50% reference, preserving `t0` for a default read but discarding the original delay/reference pair.
+It cannot store sequence bookkeeping or other experiment context, so record that provenance separately when needed.
 
-The output preserves the trace fields understood by this package, not every
-byte of the scope's original header. The tested SDS814X HD has no Binary recall
-option; its Reference recall rejected an untouched scope-written `.bin` as an
-illegal format. There is therefore no valid front-panel import control for a
-generated `.bin` on this model/firmware. Third-party reader compatibility has
-not yet been verified.
+The output preserves the fields understood by this package, not every byte from the original scope header.
+The tested SDS814X HD has no Binary recall control, and its Reference recall rejected an untouched scope-written `.bin` as an illegal format.
+Importing generated files into the scope or a third-party reader has not been verified.
 
-Gzip is transparent in both directions: give `write()` a `.gz` path and it
-compresses; `read()` and `raw_uint16()` sniff the magic bytes, so a `.bin.gz`
-(or one renamed without the suffix) opens like any other capture.
+Gzip is supported in both directions.
+`write("cap.bin.gz", trace)` compresses the output, and `read()` plus `raw_uint16()` detect gzip by its magic bytes rather than by the filename suffix.
 
-### Export to sigrok (.sr) for protocol decoding
+The summary CLI reads `.bin` and `.bin.gz` files:
 
-`siglent_sr` writes sigrok session files for libsigrokdecode protocol decoders.
-Analog channels are float32 for PulseView; logic channels are thresholded because
-`sigrok-cli` feeds decoders only logic channels.
+```sh
+siglent-bin *.bin
+python -m siglent_bin
+```
+
+## Export to sigrok
+
+`siglent_sr.write()` creates a sigrok srzip v2 session for PulseView and libsigrokdecode.
+It writes float32 analog channels and thresholded logic channels in the same sample index space.
 
 ```python
-import siglent_bin, siglent_lan, siglent_sr
+import siglent_bin
+import siglent_lan
+import siglent_sr
 
-d = siglent_bin.read("SDS814X_HD_Binary_C1_30.bin")
-siglent_sr.write("cap.sr", d)  # analog + thresholded logic
-siglent_sr.write("cap.sr", d, threshold=1.65)  # explicit threshold, in the trace's unit
-siglent_sr.write("cap.sr", d, decimate=10)  # explicit sample reduction
+d = siglent_bin.read("cap.bin")
+siglent_sr.write("cap.sr", d)
+siglent_sr.write("cap.sr", d, threshold=1.65)
+siglent_sr.write("cap.sr", d, hysteresis=0.1, decimate=10)
 
-frames = siglent_lan.fetch("192.168.1.50", "C1")  # one dict per sequence frame
-siglent_sr.write_frames("seq", frames)  # one .sr file per frame
+frames = siglent_lan.fetch("192.168.1.50", "C1")
+siglent_sr.write_frames("sequence", frames)
 ```
 
+The default threshold is the midpoint of the trace's 1st and 99th percentiles.
+Pass a scalar threshold for all traces or a `{source: threshold}` mapping for per-trace thresholds.
+`siglent_sr.write()` records the threshold and edge count in metadata, and `siglent-sr` prints the selected threshold so a poor automatic choice is visible.
+
+The CLI exposes the same controls:
+
+```sh
+siglent-sr cap.bin
+siglent-sr cap.bin --threshold 1.65 --hysteresis 0.1
+siglent-sr cap.bin --decimate 10
+siglent-sr cap.bin --no-logic
+siglent-sr cap.bin --no-analog
 ```
-siglent-sr *.bin
-sigrok-cli -i SDS814X_HD_Binary_C1_30.sr -P uart:baudrate=9600 -A uart
+
+The resulting session can be passed directly to a protocol decoder:
+
+```sh
+sigrok-cli -i cap.sr -P uart:baudrate=9600 -A uart
 ```
 
-The per-channel threshold defaults to the midpoint of the trace's 1st and 99th
-percentiles. `write()` records it and the edge count in `metadata`; `siglent-sr`
-also prints the threshold so a poor auto-pick is visible before decoding.
+The size guard refuses oversized sessions and reports a decimation factor that will fit.
+Check that narrow pulses survive before using that factor.
 
-srzip v2 has no trigger-position field (nor does libsigrok's writer expose an
-`SR_DF_TRIGGER` case), so the trigger is recorded in `metadata`. Oversized
-captures are refused with the `--decimate` factor that would fit. srzip also has
-no **per-channel unit**.
+Srzip has no trigger-position or per-channel-unit field.
+The writer records trigger timing and units in metadata, and appends non-volt units to channel names such as `C1[A]`.
+Sigrok still treats those analog values as volts.
 
-libsigrok reports every analog channel as volts, regardless of file contents.
-Non-volt traces therefore append their unit to the channel name (`C1[A]`), the
-only per-channel field viewers see; `write()` warns on stderr. Volts remain
-unsuffixed. As on the `.bin` path, `[A]` means *the scope's amps reading*: amps
-mode stores the V/A factor but not physical probe attenuation, so values are
-calibrated only as far as the scope display (see SPEC.md).
+## Supported data and limits
 
-Decimation is explicit. If a capture exceeds the srzip point/size guard, rerun
-with the reported `--decimate N` factor after checking that narrow pulses survive.
-
-## Scope & limitations
-
-- Reads analog channels (`C1`–`C4`, plus format-documented `C5`–`C8`), math traces
-  (`F1`–`F4`), and zoom (`Z1`–`Z4`) saves. Zoom saves slice the parent record and use
-  the stored zoom timebase. Native digital (D0–D15) data is not decoded: when it
-  accompanies a supported trace, the reader returns that trace, emits
-  `UnsupportedTraceWarning`, and lists the omitted channels in
-  `unsupported_sources`; a digital-only file is unsupported. Reference waveforms
-  are also not parsed.
-- Absolute time needs the scope's horizontal reference position, which the header
-  does not record: pass `ref_position=` (default 50 = screen centre) to `read()`
-  if the scope was set elsewhere. Relative timing is unaffected either way, and
-  `siglent_lan` queries the value. Files produced by `write()` are canonicalised
-  to 50% so their default-read `t0` is self-contained. See SPEC.md.
-- Amps display mode returns amps (`unit` is `'A'`), but only as calibrated by the
-  scope: physical probe attenuation is absent from the file (see SPEC.md).
-- Most acquisition/display state is absent: interpolation and peak detect leave no
-  header trace (peak-detect samples interleave a min/max envelope); sequence exports
-  ordinary files without timestamps; and the header stores save-time, not
-  acquisition-time, horizontal delay (see SPEC.md).
-- The SDS814X HD writes 16-bit little-endian. The format-defined 8-bit
-  (`data_width=0`) and big-endian paths are implemented but not produced by this scope.
-- For threshold/PWM decoding of a returned analog trace, use `raw`/`raw_uint16`
-  and skip the volts conversion entirely.
+- Reads analog channels `C1`-`C8`, math traces `F1`-`F4`, and zoom saves `Z1`-`Z4`.
+- Native digital data is not decoded.
+  A mixed file returns its supported trace, emits `UnsupportedTraceWarning`, and lists omitted channels in `unsupported_sources`.
+  A digital-only file raises `NotImplementedError`.
+- Reference waveforms are not parsed.
+- Peak-detect samples contain a min/max envelope, but the file has no peak-detect marker.
+- A normal binary save from a sequence acquisition contains the displayed segment only.
+  Save-all exports do not contain per-segment trigger timestamps, so inter-segment timing cannot be reconstructed.
+- Interpolation leaves no marker in the tested files.
+- The SDS814X writes 16-bit little-endian samples.
+  8-bit, big-endian, and C5-C8 paths have synthetic tests but no corresponding real capture in this repository.
+- The amps unit represents the scope's displayed current.
+  The file does not separately store physical probe attenuation, so it may not represent circuit current.
 
 ## Verification
 
-The conversion math is calibrated against unmodified SDS814X captures of known
-levels (0 / 3 / 4.5 / 5 V), probe 1×/10×, varied vertical/horizontal settings
-(including vernier V/div and a window excluding 0 V), channel invert, amps mode
-across V/A factors, and math/zoom saves against their parent records. They are the
-repository fixtures: `python3 tests/test_siglent_bin.py` (or `pytest`). C5–C8,
-8-bit, and big-endian paths have synthetic tests only; captures from other SDS
-models are welcome.
+The fixtures are unmodified SDS814X HD captures.
+They cover known levels (0, 3, 4.5, and 5 V), 1×/10× probes, vernier scale, non-centred timing, channel invert, amps mode across V/A factors, and math/zoom saves checked against their parent records.
+Sequence behavior, gzip, and sigrok export are also covered by the test suite.
+C5-C8, 8-bit, and big-endian paths have synthetic tests only; captures from other SDS models are welcome.
+
+Run the tests with:
+
+```sh
+pytest
+```
 
 For a general multi-format parser, see [RigolWFM](https://github.com/scottprahl/RigolWFM).
-As of 1.5.0, its Siglent V4.0 conversion follows the vendor document (`+ vert_offset`,
-no probe factor) and disagrees with these captures on both counts.
+Its Siglent V4.0 conversion differs from the formula verified here.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 ## Credit
 
-Format distilled from Siglent's [*How to Extract Data from the Binary File of SIGLENT
-Oscilloscope*](https://www.siglenteu.com/wp-content/uploads/dlm_uploads/2025/10/How-to-Extract-Data-from-the-Binary-FileEN03B.pdf)
-(V4.0), corrected and extended by reverse-engineering real captures.
+The format was distilled from Siglent's [*How to Extract Data from the Binary File of SIGLENT Oscilloscope*](https://www.siglenteu.com/wp-content/uploads/dlm_uploads/2025/10/How-to-Extract-Data-from-the-Binary-FileEN03B.pdf) (V4.0), then corrected and extended against real captures.
