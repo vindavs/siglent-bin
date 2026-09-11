@@ -11,7 +11,7 @@ The package has one runtime dependency: NumPy.
 
 The saved-file reader is built around three details that are easy to get wrong:
 
-- SDS800X HD 16-bit samples are offset-binary `uint16`, centred at `32768`.
+- SDS800X HD 16-bit samples are offset-binary `uint16`, centered at `32768`.
 - The voltage conversion uses `- vert_offset` and applies the probe factor to the whole expression.
 - The time axis adds `time_delay`; its absolute position also needs the horizontal reference position, which the file does not store.
 
@@ -69,7 +69,7 @@ Use `strict=False` only when you want to bypass its axis-compatibility check.
 ### Absolute time
 
 The V4 header does not store the horizontal reference position.
-`read()` therefore accepts `ref_position` in percent and defaults to `50`, the screen centre.
+`read()` therefore accepts `ref_position` in percent and defaults to `50`, the screen center.
 
 ```python
 d = siglent_bin.read("cap.bin", ref_position=30)
@@ -83,7 +83,7 @@ t[i] = t0 + i / sample_rate
 ```
 
 Relative timing remains correct when the reference position is unknown.
-The `read()` argument is also applied to zoom records, but non-centre zoom references have not been tested.
+The `read()` argument is also applied to zoom records, but non-center zoom references have not been tested.
 
 The scope stores the horizontal settings that existed when the file was saved.
 If the delay or reference controls changed after acquisition and before saving, the stored absolute timing can be wrong.
@@ -109,7 +109,7 @@ It sends `:TRIGger:STOP` before reading by default so a completed sequence buffe
 Pass `stop=False` when a running acquisition must not be disturbed.
 
 Live samples arrive as signed integers, unlike saved-file samples.
-The LAN reader normalises them to the saved-file `raw` convention, so live and saved traces can be compared directly.
+The LAN reader normalizes them to the saved-file `raw` convention, so live and saved traces can be compared directly.
 
 The live descriptor has no stable unit field on the tested firmware.
 For channel sources, the reader queries `:CHANnel<n>:UNIT?` and returns the result as `unit`.
@@ -119,7 +119,7 @@ Math and zoom sources have no equivalent query and return `unit=None`.
 It resembles a date/time on the tested firmware but is not acquisition time.
 
 Siglent documents this scope family as having no RTC.
-Synchronise its session clock explicitly when needed:
+Synchronize its session clock explicitly when needed:
 
 ```python
 siglent_lan.sync_clock("192.168.1.50")
@@ -152,7 +152,7 @@ The writer rejects math and zoom traces, 8-bit data, fractional `code_per_div`, 
 It validates the stored fields instead of guessing missing values.
 
 The format has no horizontal reference-position field.
-The writer canonicalises the delay to a 50% reference, preserving `t0` for a default read but discarding the original delay/reference pair.
+The writer canonicalizes the delay to a 50% reference, preserving `t0` for a default read but discarding the original delay/reference pair.
 It cannot store sequence bookkeeping or other experiment context, so record that provenance separately when needed.
 
 The output preserves the fields understood by this package, not every byte from the original scope header.
@@ -234,7 +234,7 @@ Sigrok still treats those analog values as volts.
 ## Verification
 
 The fixtures are unmodified SDS814X HD captures.
-They cover known levels (0, 3, 4.5, and 5 V), 1×/10× probes, vernier scale, non-centred timing, channel invert, amps mode across V/A factors, and math/zoom saves checked against their parent records.
+They cover known levels (0, 3, 4.5, and 5 V), 1×/10× probes, vernier scale, non-centered timing, channel invert, amps mode across V/A factors, and math/zoom saves checked against their parent records.
 Sequence behavior, gzip, and sigrok export are also covered by the test suite.
 C5-C8, 8-bit, and big-endian paths have synthetic tests only; captures from other SDS models are welcome.
 

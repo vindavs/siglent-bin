@@ -54,7 +54,7 @@ document) or **[obs]** (established by observation here — treat as inference).
 | memory (REF) fields | 0x664–0xaf3 | — | [doc] | reference-waveform switches/scales; not parsed here |
 | `zoom_switch` | 0xaf4 | int32 | [doc] | 1 = this file is the zoom trace (see Zoom saves) |
 | `zoom_td_val` | 0xaf8 | Data-With-Unit | [doc] | zoom window s/div |
-| `zoom_trig_delay_val` | 0xb20 | Data-With-Unit | [doc] | zoom window delay (centre position) |
+| `zoom_trig_delay_val` | 0xb20 | Data-With-Unit | [doc] | zoom window delay (center position) |
 | `zoom_vdiv_val` / `zoom_vpos_val` | 0xb48 / 0xc88 | 8× Data-With-Unit | [doc] | zoom vertical display scale — the stored codes stay in channel units |
 | sample data | 0x1000 | uint16[] / uint8[] | [doc] | offset-binary — see encoding below |
 
@@ -140,7 +140,7 @@ reading in that unit," not calibrated physical quantities.
 ## Sample encoding — the one that bites
 
 **[doc]** 16-bit samples (`data_width = 1`) are **offset-binary**, mid-scale (0-code
-reference) at **32768**. 8-bit samples are centred at 128.
+reference) at **32768**. 8-bit samples are centered at 128.
 
 **[obs]** Read them as **unsigned** uint16. Reading as *signed* int16 inverts the trace
 whenever its two logic levels sit on opposite sides of 32768 — codes above 32768 wrap to
@@ -182,7 +182,7 @@ uint16.
 
 **[obs]** **Channel invert leaves no header flag.** Two captures of one signal that differ
 only in the front-panel Invert toggle have *identical* headers (the only differing bytes
-are uninitialised pointer-like values near 0x200–0x23f that vary save-to-save). The
+are uninitialized pointer-like values near 0x200–0x23f that vary save-to-save). The
 inversion is baked into the stored samples — an inverted 0 V/+3 V signal is stored as, and
 reads back as, a 0 V/−3 V trace. So a reader needs no invert handling: it faithfully
 reproduces whatever was captured. (It also cannot *warn* that invert was on — there's
@@ -205,9 +205,9 @@ file as the zoom trace, and the doc directs readers to `zoom_td_val` /
 zoom window is horizontal, shared by all channels) while `zoom_vdiv_val` /
 `zoom_vpos_val` are per-channel arrays. Only C1's zoom trace has been exercised here.
 
-- **[obs]** The window centre sits at **+`zoom_trig_delay_val`**:
+- **[obs]** The window center sits at **+`zoom_trig_delay_val`**:
   `t0 = delay − td·grid/2`. Verified against byte-located slices of three captures with
-  window centres read off the screen (+15 ms and +20 ms at 2 ms/div, +20 ms at
+  window centers read off the screen (+15 ms and +20 ms at 2 ms/div, +20 ms at
   5 ms/div). This is the 50% reference-position case of the general time-axis
   expression below.
 - **[obs]** Vertical conversion still uses the source channel's vdiv/offset/code-per-div
@@ -234,7 +234,7 @@ t0 = -(P/100) * time_div * hori_div_num + time_delay
 t[i] = t0 + i / sample_rate
 ```
 
-The expression was verified on three trigger-synchronised captures at `P = 30%`:
+The expression was verified on three trigger-synchronized captures at `P = 30%`:
 
 | capture | P | span | delay | predicts | trigger observed at |
 |---|---|---|---|---|---|
@@ -260,16 +260,16 @@ Each file's samples are byte-identical to the LAN fetch of the same
 acquisition, and reading it at the reference position then in force placed
 t = 0 on the edge to within one sample. The `ref20` rows are also what rules
 out `-time_div*grid/2` on its own: at P = 20 % with no delay the trigger is at
-sample 2000, three divisions from centre.
+sample 2000, three divisions from center.
 
 The V4 header does not store `P`: a scan of every int32 in the 4 KB header found
 only `0x26c = 10`, the horizontal division count. `read()` therefore takes
-`ref_position=` and defaults to screen centre (`50%`), while `fetch()` queries
+`ref_position=` and defaults to screen center (`50%`), while `fetch()` queries
 the current value. Sample spacing remains valid if the position is unknown, but
-the absolute placement of zero does not. Neither function materialises the full
+the absolute placement of zero does not. Neither function materializes the full
 axis; `siglent_bin.time_axis()` returns the float64 `t[i]` values.
 
-`write()` canonicalises the stored delay to 50% so a default read reproduces the
+`write()` canonicalizes the stored delay to 50% so a default read reproduces the
 input trace's `t0`; it does not preserve the original front-panel delay/reference
 pair. `:TIMebase:REFerence` selects the strategy (`DELay` or `POSition`); only
 `DELay` has been tested. `siglent_lan` reports the queried strategy as
@@ -313,7 +313,7 @@ A/B-verified on the SDS814X by re-saving controlled acquisitions: **[obs]**
   3,000-value waveform region whose transition was at the same relative horizontal
   position. On the scope, the reference retained vertical scale and offset and
   could be scaled or moved vertically. It retained the 100 ms horizontal span,
-  but displayed it as -50 to +50 ms around screen centre. The matched live trace
+  but displayed it as -50 to +50 ms around screen center. The matched live trace
   used a 30% horizontal reference and ran from -30 to +70 ms; its edge remained
   near 30% in the reference overlay rather than moving to the displayed zero.
   Acquisition pan and zoom did not move the overlay. This establishes that
@@ -398,7 +398,7 @@ guide (EN11F), including its "Read Sequence Waveform Data Example" (p. 782).
   in amps display mode against one in volts shows a single differing region,
   `0x0d8..0x0d9` — and two *identical* runs (nothing touched between them) differ
   in that same region. The bytes around it read as `0x7f...` x86-64 addresses,
-  consistent with uninitialised firmware memory. That region is not treated as
+  consistent with uninitialized firmware memory. That region is not treated as
   stable descriptor data. The unit
   comes from `:CHANnel<n>:UNIT?` instead, which answers `V` / `A` cleanly (short
   form `:CHAN<n>:UNIT?` works). On this firmware,
@@ -425,8 +425,8 @@ guide (EN11F), including its "Read Sequence Waveform Data Example" (p. 782).
   layout.** scopehal interprets the 16 bytes as two float64 values; the tested HD
   descriptor instead yields the date/time-shaped fields described above. Treat
   these as distinct descriptor layouts rather than interchangeable records.
-- **[doc]** Samples arrive as **signed** integers centred on 0 (the vendor example
-  unpacks `h`), where a saved file stores offset-binary uint16 centred on 32768.
+- **[doc]** Samples arrive as **signed** integers centered on 0 (the vendor example
+  unpacks `h`), where a saved file stores offset-binary uint16 centered on 32768.
   `siglent_lan` shifts by +32768 so both paths hand back the same convention.
 - ⚠️ **[obs]** `:WAVeform:SEQuence` does **not** behave as documented here. The doc
   says `value1 = 0` returns every frame that fits one transfer, with `value2`
@@ -451,17 +451,17 @@ guide (EN11F), including its "Read Sequence Waveform Data Example" (p. 782).
   `#9...` with it off. Anything before the `#` must be skipped, not treated as an
   error. Its optional terminator may arrive in a later TCP packet; text reads
   discard an empty framing line so it cannot shift subsequent responses.
-- ⚠️ **[obs]** **The delay field at 0xb4 is referred to screen centre.** Measured
+- ⚠️ **[obs]** **The delay field at 0xb4 is referred to screen center.** Measured
   on the SDS814X HD (fw 4.8.12.1.1.6.5) over 4 reference
   positions x 3 delays, 12/12 exact:
 
       desc_delay = :TIMebase:DELay? + (0.5 - ref_position/100) * time_div * grid
 
-  `:TIMebase:DELay?` is referred to the *reference position*; 0xb4 is referred to centre. The
+  `:TIMebase:DELay?` is referred to the *reference position*; 0xb4 is referred to center. The
   two axes are therefore identical, and both of these give the same `t0` at every setting:
 
       ours:   t0 = delay - (ref_position/100) * time_div * grid
-      centre: t0 = desc_delay - time_div * grid / 2
+      center: t0 = desc_delay - time_div * grid / 2
 
 - ⚠️ **[obs]** **The timebase index at 0x144 was not portable on the tested model.** It read 20 — whose enum
   entry is 500 us — while the scope reported 1 ms/div. The guide itself says the enumeration
@@ -469,10 +469,10 @@ guide (EN11F), including its "Read Sequence Waveform Data Example" (p. 782).
   enumeration"). `siglent_lan` therefore takes the timebase from
   `:TIMebase:SCALe?` rather than applying a cross-model enum mapping.
 - **[obs]** The vendor's live axis formula (`t = -tdiv*grid/2 + i*interval + delay`) *adds*
-  the delay term where the saved-file formula subtracts it. With the centre-referred reading
+  the delay term where the saved-file formula subtracts it. With the center-referred reading
   above, the vendor's form is the consistent one for 0xb4 and the file's form is the
   consistent one for `:TIMebase:DELay?`. `descriptor_audit()` reports the queried
-  reference position, the expected centre-referred delay, their difference and
+  reference position, the expected center-referred delay, their difference and
   match result, along with `data_interval`.
 - **[obs]** The descriptor's sample `interval` was finite in the tested normal and
   sequence captures. `fetch()` nevertheless prefers `:ACQuire:SRATe?` and accepts
