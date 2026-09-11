@@ -242,6 +242,26 @@ The expression was verified on three trigger-synchronised captures at `P = 30%`:
 | live, 20 ms record | 30 % | 20 ms | -8 ms | sample 7000 | 7003 |
 | live, 100 ms record | 30 % | 100 ms | 0 | sample 3000 | 3000 |
 
+⚠️ **[obs]** **The delay term adds.** Siglent's document and RigolWFM place the
+record at `-time_div*grid/2 - time_delay`; the sign was settled against a
+trigger-locked feature. Five captures of the 1 kHz calibration square
+(20 µs/div, 10 kpt at 50 MSa/s), each a **fresh single acquisition**, put the
+triggering edge exactly where `+time_delay` predicts:
+
+| capture | P | `time_delay` | edge at | `+delay` predicts | `-delay` predicts |
+|---|---|---|---|---|---|
+| `tdelay-ref50-d0` | 50 % | 0 | 5000 | 5000 | 5000 |
+| `tdelay-ref50-dp50us` | 50 % | +50 µs | 2500 | 2500 | 7500 |
+| `tdelay-ref50-dn50us` | 50 % | -50 µs | 7500 | 7500 | 2500 |
+| `tdelay-ref20-d0` | 20 % | 0 | 2000 | 2000 | 2000 |
+| `tdelay-ref20-dp20us` | 20 % | +20 µs | 1000 | 1000 | 3000 |
+
+Each file's samples are byte-identical to the LAN fetch of the same
+acquisition, and reading it at the reference position then in force placed
+t = 0 on the edge to within one sample. The `ref20` rows are also what rules
+out `-time_div*grid/2` on its own: at P = 20 % with no delay the trigger is at
+sample 2000, three divisions from centre.
+
 The V4 header does not store `P`: a scan of every int32 in the 4 KB header found
 only `0x26c = 10`, the horizontal division count. `read()` therefore takes
 `ref_position=` and defaults to screen centre (`50%`), while `fetch()` queries
@@ -260,7 +280,13 @@ acquisition-time ones — verified directly: re-saving a stopped acquisition aft
 the delay knob produced byte-identical samples with only the stored `time_delay` changed
 (0.1 → 0.2). The samples keep their acquisition-time alignment (the zoom captures above
 showed a 0.2 s offset from exactly this), so treat absolute time as reliable only if the
-horizontal controls weren't touched between stop and save.
+horizontal controls weren't touched between stop and save. `tdelay-ref50-dp50us-stale`
+is that case as a fixture: panned from the -50 µs acquisition to +50 µs without
+re-arming, it carries the samples of `tdelay-ref50-dn50us` under the header of
+`tdelay-ref50-dp50us`, and its stored axis misplaces the trigger by 100 µs under
+either sign convention. This is why a delay pair taken from one stopped
+acquisition cannot settle the sign above; only a fresh acquisition at each delay
+moves the samples.
 
 ## Acquisition & display state — what reaches the file
 
@@ -460,6 +486,32 @@ guide (EN11F), including its "Read Sequence Waveform Data Example" (p. 782).
   samples. Converted values agreed within float32 rounding and time axes within
   float64 roundoff. This validates the signed-to-offset-binary conversion and
   axis convention on the tested model/firmware.
+
+## Saving files over SCPI
+
+The scope can write its own `.bin` to a USB stick without front-panel work, which
+is how the delay-sign fixtures below were made.
+
+- **[doc]** `:SAVE:BINary <path>,<src>` saves the on-screen trace of `<src>`
+  (`C<x>` | `F<x>` | `M<x>` | `D0_D15`) to a quoted path — `"U-disk0/name.bin"`,
+  `"local/SIGLENT/name.bin"`, or `"net_storage/name.bin"`. `:SAVE:CSV`,
+  `:SAVE:MATLab`, `:SAVE:IMAGe`, `:SAVE:SETup` and `:SAVE:REFerence` are the
+  siblings. The extension is not what selects the format (EN11F p. 342).
+- ⚠️ **[obs]** **The `:SAVE:*` headers are command-only.** Querying one
+  (`:SAVE:TYPE?`, `:SAVE:WAVeform?`) answers `-113,"Undefined header"`, which
+  reads exactly like the whole subsystem being absent from the firmware. Probe
+  with the command form and the error queue instead.
+- **[obs]** There is no directory listing, so the error queue is the only
+  confirmation: a bad path or `<src>` gives `-101,"Invalid character"`, a missing
+  `<src>` gives `-200,"Execution error"`, and a good save leaves the queue clean.
+  Existence of a file can be inferred from `:RECall:SETup EXTernal,"<path>"` —
+  an existing file of the wrong format answers `-200`, an absent path `-101`.
+- ⚠️ **[obs]** **`:SYSTem:ERRor?` pops one entry per query.** Drain it in a loop
+  before using it as a pass/fail signal, or an error from an earlier command
+  reads as the current one failing.
+- ⚠️ **[obs]** **`:ACQuire:MDEPth` does not stick when written alongside a
+  timebase change.** Write it last, then read it back; a depth written in the
+  same burst as `:TIMebase:SCALe` was silently dropped.
 
 Model- and firmware-specific capture setup and measurement practice are kept in
 the bench SDS800X HD note,
