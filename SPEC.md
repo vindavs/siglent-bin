@@ -512,7 +512,3 @@ is how the delay-sign fixtures below were made.
 - ⚠️ **[obs]** **`:ACQuire:MDEPth` does not stick when written alongside a
   timebase change.** Write it last, then read it back; a depth written in the
   same burst as `:TIMebase:SCALe` was silently dropped.
-
-Model- and firmware-specific capture setup and measurement practice are kept in
-the bench SDS800X HD note,
-not in this file-format specification.
